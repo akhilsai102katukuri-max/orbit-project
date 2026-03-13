@@ -252,9 +252,12 @@ def analyze_frame():
         return jsonify({"violations": [], "face_count": 0, "error": str(e)}), 500
 
 
+# Load models at startup — runs with both gunicorn and python directly
+print("Loading models...", flush=True)
+load_models()
+print("Models loaded, ready to serve!", flush=True)
+
 if __name__ == '__main__':
-    print("Loading models...", flush=True)
-    load_models()
     print("Starting Flask server on port 5000...", flush=True)
     print("Running on http://127.0.0.1:5000", flush=True)
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
