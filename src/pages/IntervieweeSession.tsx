@@ -76,79 +76,31 @@ function PermissionScreen({ onGranted }: { onGranted: (stream: MediaStream) => v
   );
 }
 
-function scoreAnswerFallback(expected: string, given: string): number {
+// FIX 2: Word-to-word comparison scoring (no Gemini)
+function scoreAnswer(expected: string, given: string): number {
   if (!given.trim()) return 0;
   const expectedWords = expected.toLowerCase().split(/\s+/).filter(Boolean);
   const givenWords = given.toLowerCase().split(/\s+/).filter(Boolean);
-  if (expectedWords.length === 0) return 100;
+  if (expectedWords.length === 0) return givenWords.length > 0 ? 100 : 0;
   const matches = expectedWords.filter((w) => givenWords.includes(w)).length;
   return Math.min(100, Math.round((matches / expectedWords.length) * 100));
 }
 
-async function getAIScores(
+function getScores(
   questions: Question[],
   answers: Record<string, string>
-): Promise<{ score: number; feedback: string }[]> {
-  const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
-  if (!apiKey) {
-    return questions.map((q) => ({
-      score: scoreAnswerFallback(q.expected_answer, answers[q.id] || ""),
-      feedback: "Score based on answer relevance to expected response.",
-    }));
-  }
-
-  try {
-    const prompt = `You are an AI interview evaluator. Score each answer from 0-100 and give brief feedback.\n\n${questions
-      .map(
-        (q, i) =>
-          `Question ${i + 1}: ${q.question_text}\nExpected Answer: ${q.expected_answer}\nCandidate Answer: ${answers[q.id] || "(no answer provided)"}`
-      )
-      .join("\n\n")}\n\nRespond ONLY with a JSON array like:\n[{"score": 85, "feedback": "Good answer covering key points."}, ...]\n\nOne object per question in the same order.`;
-
-    const resp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.2, maxOutputTokens: 1000 },
-        }),
-      }
-    );
-
-    if (!resp.ok) throw new Error(`Gemini error: ${resp.status}`);
-
-    const data = await resp.json();
-    const rawText: string | undefined = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    const cleaned = rawText?.replace(/```json/gi, "")?.replace(/```/g, "")?.trim();
-
-    if (!cleaned) throw new Error("Empty AI response");
-
-    let parsed: any;
-    try {
-      parsed = JSON.parse(cleaned);
-    } catch {
-      return questions.map((q) => ({
-        score: scoreAnswerFallback(q.expected_answer, answers[q.id] || ""),
-        feedback: "Score based on answer relevance to expected response.",
-      }));
-    }
-
-    if (!Array.isArray(parsed) || parsed.length !== questions.length) throw new Error("AI response length mismatch");
-
-    return questions.map((q, i) => {
-      const item = parsed[i] ?? {};
-      const score = typeof item.score === "number" ? Math.max(0, Math.min(100, Math.round(item.score))) : scoreAnswerFallback(q.expected_answer, answers[q.id] || "");
-      const feedback = typeof item.feedback === "string" && item.feedback.trim().length > 0 ? item.feedback.trim() : "Score based on answer relevance to expected response.";
-      return { score, feedback };
-    });
-  } catch {
-    return questions.map((q) => ({
-      score: scoreAnswerFallback(q.expected_answer, answers[q.id] || ""),
-      feedback: "Score based on answer relevance to expected response.",
-    }));
-  }
+): { score: number; feedback: string }[] {
+  return questions.map((q) => {
+    const given = answers[q.id] || "";
+    const score = scoreAnswer(q.expected_answer, given);
+    let feedback = "Score based on answer relevance to expected response.";
+    if (!given.trim()) feedback = "No answer provided.";
+    else if (score >= 80) feedback = "Excellent answer covering key points.";
+    else if (score >= 50) feedback = "Good answer but missing some key points.";
+    else if (score > 0) feedback = "Answer partially matches expected response.";
+    else feedback = "Answer does not match expected response.";
+    return { score, feedback };
+  });
 }
 
 async function analyzeFrame(
@@ -156,7 +108,8 @@ async function analyzeFrame(
   interviewId: string,
   userId: string,
   onViolations: (violations: Violation[]) => void,
-  onHighSeverity: () => void
+  onHighSeverity: () => void,
+  onGazeAway: () => void
 ): Promise<void> {
   try {
     const video = videoRef.current;
@@ -183,6 +136,8 @@ async function analyzeFrame(
       onViolations(result.violations);
       for (const v of result.violations) {
         if (v.severity === "high") onHighSeverity();
+        // FIX 4: trigger gaze counter for gaze_away violations
+        if (v.type === "gaze_away") onGazeAway();
         await (supabase as any).from("proctoring_logs").insert({
           interview_id: interviewId,
           user_id: userId,
@@ -197,15 +152,26 @@ async function analyzeFrame(
   }
 }
 
+// FIX 1: Fixed VoiceAnswer — proper ref-based transcript to avoid stale closure
 function VoiceAnswer({ questionId, value, onChange }: { questionId: string; value: string; onChange: (id: string, text: string) => void }) {
   const [isRecording, setIsRecording] = useState(false);
   const [supported, setSupported] = useState(true);
   const recognitionRef = useRef<any>(null);
+  const isRecordingRef = useRef(false);
+  const finalTranscriptRef = useRef(value);
+
+  // Keep ref in sync with prop value
+  useEffect(() => {
+    finalTranscriptRef.current = value;
+  }, [value]);
 
   useEffect(() => {
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SR) setSupported(false);
-    return () => recognitionRef.current?.stop();
+    return () => {
+      recognitionRef.current?.stop();
+      isRecordingRef.current = false;
+    };
   }, []);
 
   const startRecording = () => {
@@ -214,15 +180,13 @@ function VoiceAnswer({ questionId, value, onChange }: { questionId: string; valu
     const recognition = new SR();
     recognition.continuous = true;
     recognition.interimResults = true;
-    recognition.lang = "en-IN"; // Indian English for better accuracy
-    recognition.maxAlternatives = 3; // get multiple alternatives, pick best
-    let finalTranscript = value;
+    recognition.lang = "en-IN";
+    recognition.maxAlternatives = 3;
 
     recognition.onresult = (event: any) => {
       let interim = "";
       for (let i = event.resultIndex; i < event.results.length; i++) {
         if (event.results[i].isFinal) {
-          // Pick the highest confidence alternative
           let bestTranscript = event.results[i][0].transcript;
           let bestConfidence = event.results[i][0].confidence || 0;
           for (let j = 1; j < event.results[i].length; j++) {
@@ -231,38 +195,48 @@ function VoiceAnswer({ questionId, value, onChange }: { questionId: string; valu
               bestTranscript = event.results[i][j].transcript;
             }
           }
-          finalTranscript += (finalTranscript ? " " : "") + bestTranscript.trim();
+          finalTranscriptRef.current = (finalTranscriptRef.current ? finalTranscriptRef.current + " " : "") + bestTranscript.trim();
         } else {
           interim = event.results[i][0].transcript;
         }
       }
-      onChange(questionId, finalTranscript + (interim ? " " + interim : ""));
+      // FIX 1: use ref value — no stale closure issue
+      onChange(questionId, finalTranscriptRef.current + (interim ? " " + interim : ""));
     };
 
     recognition.onerror = (e: any) => {
       if (e.error === "no-speech") {
-        // Auto restart on silence
-        recognitionRef.current?.start();
+        if (isRecordingRef.current) {
+          try { recognitionRef.current?.start(); } catch {}
+        }
       } else if (e.error !== "aborted") {
         toast.error(`Speech error: ${e.error}`);
         setIsRecording(false);
+        isRecordingRef.current = false;
       }
     };
+
     recognition.onend = () => {
-      // Auto restart if still recording (handles Chrome auto-stop)
-      if (recognitionRef.current && isRecording) {
+      if (isRecordingRef.current) {
         try { recognitionRef.current.start(); } catch {}
       } else {
         setIsRecording(false);
       }
     };
+
     recognitionRef.current = recognition;
+    isRecordingRef.current = true;
     recognition.start();
     setIsRecording(true);
     toast.success("Recording started — speak clearly", { id: "rec-start" });
   };
 
-  const stopRecording = () => { recognitionRef.current?.stop(); setIsRecording(false); toast.success("Recording stopped", { id: "rec-stop" }); };
+  const stopRecording = () => {
+    isRecordingRef.current = false;
+    recognitionRef.current?.stop();
+    setIsRecording(false);
+    toast.success("Recording stopped", { id: "rec-stop" });
+  };
 
   if (!supported) return <div className="p-4 rounded-lg bg-destructive/10 border border-destructive/20 text-sm text-destructive">Speech recognition not supported. Use Google Chrome.</div>;
 
@@ -277,7 +251,7 @@ function VoiceAnswer({ questionId, value, onChange }: { questionId: string; valu
       <div className="min-h-[150px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground overflow-y-auto whitespace-pre-wrap">
         {value || <span className="text-muted-foreground">Press "Start Recording" and speak your answer.</span>}
       </div>
-      {value && <Button type="button" variant="ghost" size="sm" className="text-muted-foreground text-xs" onClick={() => onChange(questionId, "")}>Clear answer</Button>}
+      {value && <Button type="button" variant="ghost" size="sm" className="text-muted-foreground text-xs" onClick={() => { finalTranscriptRef.current = ""; onChange(questionId, ""); }}>Clear answer</Button>}
     </div>
   );
 }
@@ -304,6 +278,9 @@ export default function IntervieweeSession() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
 
+  // FIX 4: gaze away counter — 3 gaze detections = 1 warning
+  const gazeCountRef = useRef(0);
+
   const handleProctoringTerminate = useCallback(async () => {
     if (interviewId) {
       await (supabase as any).from("interview_participants")
@@ -327,6 +304,24 @@ export default function IntervieweeSession() {
       }
       return next;
     });
+  }, [handleProctoringTerminate]);
+
+  // FIX 4: every 3 gaze detections = 1 warning
+  const handleGazeAway = useCallback(() => {
+    gazeCountRef.current += 1;
+    if (gazeCountRef.current >= 3) {
+      gazeCountRef.current = 0;
+      setWarningCount((c) => {
+        const next = c + 1;
+        if (next >= 3) {
+          toast.error("Interview terminated due to repeated gaze violations.", { duration: 8000 });
+          handleProctoringTerminate();
+        } else {
+          toast.warning(`⚠️ Gaze warning! Looking away too often. Warning ${next}/3`, { duration: 4000 });
+        }
+        return next;
+      });
+    }
   }, [handleProctoringTerminate]);
 
   const { multipleFaces, multipleVoices, faceCount } = useProctoring({
@@ -358,14 +353,14 @@ export default function IntervieweeSession() {
           setAiViolations(violations);
           setTimeout(() => setAiViolations([]), 8000);
         },
-        handleHighSeverityViolation
+        handleHighSeverityViolation,
+        handleGazeAway   // FIX 4
       );
     }, 2000);
 
     return () => clearInterval(interval);
-  }, [permissionsGranted, cameraStream, interviewId, user, apiConnected, handleHighSeverityViolation]);
+  }, [permissionsGranted, cameraStream, interviewId, user, apiConnected, handleHighSeverityViolation, handleGazeAway]);
 
-  // Timer countdown — starts after permissions granted AND questions loaded (timeLeft set from DB)
   useEffect(() => {
     if (!permissionsGranted || timeLeft === 0) return;
     const timer = setInterval(() => {
@@ -423,6 +418,7 @@ export default function IntervieweeSession() {
     return () => window.removeEventListener("keydown", block, true);
   }, [permissionsGranted, enterFullscreen]);
 
+  // FIX 3: auto return to fullscreen after warning
   useEffect(() => {
     if (!permissionsGranted) return;
     const handleFsChange = () => {
@@ -431,11 +427,21 @@ export default function IntervieweeSession() {
         setWarningCount((c) => {
           const next = c + 1;
           toast.warning(`⚠️ Fullscreen exit! Warning ${next}/3`, { duration: 5000 });
-          if (next >= 3) { toast.error("Interview terminated.", { duration: 8000 }); navigate("/interviewee"); }
+          if (next >= 3) {
+            toast.error("Interview terminated.", { duration: 8000 });
+            navigate("/interviewee");
+          }
           return next;
         });
-        setTimeout(() => enterFullscreen(), 1000);
-      } else { setIsFullscreen(true); }
+        // FIX 3: auto return to fullscreen after 1.5 seconds
+        setTimeout(() => {
+          if (!document.fullscreenElement) {
+            enterFullscreen();
+          }
+        }, 1500);
+      } else {
+        setIsFullscreen(true);
+      }
     };
     document.addEventListener("fullscreenchange", handleFsChange);
     return () => document.removeEventListener("fullscreenchange", handleFsChange);
@@ -484,7 +490,6 @@ export default function IntervieweeSession() {
 
   useEffect(() => {
     const fetchQuestions = async () => {
-      // Block terminated candidates
       if (user) {
         const { data: participant } = await (supabase as any)
           .from("interview_participants")
@@ -530,10 +535,10 @@ export default function IntervieweeSession() {
         .from("profiles").select("full_name").eq("id", user.id).maybeSingle();
       const userName = profileData?.full_name || user.email || "Unknown";
 
-      toast.info("Evaluating your answers with AI...", { id: "ai-scoring" });
-      const aiResults = await getAIScores(questions, answers);
+      // FIX 2: use word-comparison scoring only
+      toast.info("Evaluating your answers...", { id: "ai-scoring" });
+      const results = getScores(questions, answers);
 
-      // Save to interviewee_responses (primary table)
       const { error: respError } = await (supabase as any).from("interviewee_responses").insert(
         questions.map((q, i) => ({
           interview_id: interviewId,
@@ -541,14 +546,15 @@ export default function IntervieweeSession() {
           user_id: user.id,
           interviewee_user_id: user.id,
           interviewee_name: userName,
-          answer_text: answers[q.id] || "",
-          score: aiResults[i]?.score ?? 0,
-          ai_score: aiResults[i]?.score ?? 0,
-          feedback: aiResults[i]?.feedback ?? "",
-          ai_feedback: aiResults[i]?.feedback ?? "",
+          answer_text: answers[q.id] || "",   // FIX 1: save actual answer
+          score: results[i]?.score ?? 0,
+          ai_score: results[i]?.score ?? 0,
+          feedback: results[i]?.feedback ?? "",
+          ai_feedback: results[i]?.feedback ?? "",
           submitted_at: new Date().toISOString(),
         }))
       );
+
       if (respError) {
         console.error("Response save error:", JSON.stringify(respError));
         toast.error("Failed to save responses: " + respError.message);
@@ -566,8 +572,8 @@ export default function IntervieweeSession() {
         }
       } catch (uploadErr) { console.warn("Video upload failed:", uploadErr); }
 
-      const finalScore = aiResults.length > 0
-        ? Math.round(aiResults.reduce((sum, r) => sum + r.score, 0) / aiResults.length) : 0;
+      const finalScore = results.length > 0
+        ? Math.round(results.reduce((sum, r) => sum + r.score, 0) / results.length) : 0;
 
       await (supabase as any).from("interview_participants")
         .update({ status: "completed", final_score: finalScore })
