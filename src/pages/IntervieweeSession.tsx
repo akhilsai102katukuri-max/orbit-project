@@ -170,7 +170,7 @@ async function analyzeFrame(
     ctx.drawImage(video, 0, 0);
     const frameData = canvas.toDataURL("image/jpeg", 0.5);
 
-    const resp = await fetch("http://localhost:5000/analyze", {
+    const resp = await fetch("https://akhilsai-328-orbit-proctoring-api.hf.space/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ frame: frameData }),
@@ -339,7 +339,7 @@ export default function IntervieweeSession() {
   }, []);
 
   useEffect(() => {
-    fetch("http://localhost:5000/health")
+    fetch("https://akhilsai-328-orbit-proctoring-api.hf.space/health")
       .then(r => r.json())
       .then(d => { if (d.status === "running") setApiConnected(true); })
       .catch(() => setApiConnected(false));
