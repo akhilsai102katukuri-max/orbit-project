@@ -451,6 +451,9 @@ export default function IntervieweeSession() {
   // Use a ref for warningCount so callbacks always see fresh value
   const warningCountRef = useRef(0);
   const terminatedRef = useRef(false); // prevent double-terminate
+  const navigateRef = useRef(navigate);
+  // Keep navigateRef always pointing to latest navigate function
+  useEffect(() => { navigateRef.current = navigate; }, [navigate]);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
@@ -471,41 +474,49 @@ export default function IntervieweeSession() {
     }
   }, []);
 
-  // ── Terminate session (mark DB + save recording + stop everything) ──
+  // ── Terminate session — navigate INSTANTLY, do DB/recording in background ──
   const terminateSession = useCallback(
-    async (reason: string) => {
+    (reason: string) => {
       if (terminatedRef.current) return;
       terminatedRef.current = true;
 
-      if (interviewId && user?.id) {
-        await (supabase as any)
-          .from("interview_participants")
-          .update({ status: "terminated" })
-          .eq("interview_id", interviewId)
-          .eq("user_id", user.id);
-      }
-
-      try {
-        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-          mediaRecorderRef.current.stop();
-          await new Promise((r) => setTimeout(r, 800));
-        }
-        if (recordedChunksRef.current.length > 0 && user?.id && interviewId) {
-          const blob = new Blob(recordedChunksRef.current, { type: "video/webm" });
-          const filePath = `${user.id}/${interviewId}_${Date.now()}.webm`;
-          await supabase.storage.from("interview-recordings").upload(filePath, blob);
-        }
-      } catch (uploadErr) {
-        console.warn("Recording upload on termination failed:", uploadErr);
-      }
-
+      // Show error toast immediately
       toast.error(reason, { duration: 8000 });
-      // Use ref — always has the latest stream, no stale closure
+
+      // Stop camera immediately
       cameraStreamRef.current?.getTracks().forEach((t) => t.stop());
-      if (document.fullscreenElement) await document.exitFullscreen().catch(() => {});
-      navigate("/interviewee");
+
+      // Exit fullscreen immediately
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+
+      // Navigate IMMEDIATELY — no awaiting
+      navigateRef.current("/interviewee");
+
+      // Do DB update and recording upload in background (non-blocking)
+      (async () => {
+        try {
+          if (interviewId && user?.id) {
+            await (supabase as any)
+              .from("interview_participants")
+              .update({ status: "terminated" })
+              .eq("interview_id", interviewId)
+              .eq("user_id", user.id);
+          }
+          if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+            mediaRecorderRef.current.stop();
+            await new Promise((r) => setTimeout(r, 800));
+          }
+          if (recordedChunksRef.current.length > 0 && user?.id && interviewId) {
+            const blob = new Blob(recordedChunksRef.current, { type: "video/webm" });
+            const filePath = `${user.id}/${interviewId}_${Date.now()}.webm`;
+            await supabase.storage.from("interview-recordings").upload(filePath, blob);
+          }
+        } catch (err) {
+          console.warn("Background termination cleanup failed:", err);
+        }
+      })();
     },
-    [interviewId, user, navigate]
+    [interviewId, user]
   );
 
   // ── Add a warning; terminate immediately if count reaches 3 ──
