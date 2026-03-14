@@ -436,6 +436,7 @@ export default function IntervieweeSession() {
 
   const [permissionsGranted, setPermissionsGranted] = useState(false);
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
   const [questions, setQuestions] = useState<Question[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [answers, setAnswers] = useState<Record<string, string>>({});
@@ -476,7 +477,6 @@ export default function IntervieweeSession() {
       if (terminatedRef.current) return;
       terminatedRef.current = true;
 
-      // Mark as terminated in DB so the candidate cannot rejoin
       if (interviewId && user?.id) {
         await (supabase as any)
           .from("interview_participants")
@@ -485,7 +485,6 @@ export default function IntervieweeSession() {
           .eq("user_id", user.id);
       }
 
-      // Save recording even on termination
       try {
         if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
           mediaRecorderRef.current.stop();
@@ -501,11 +500,12 @@ export default function IntervieweeSession() {
       }
 
       toast.error(reason, { duration: 8000 });
-      cameraStream?.getTracks().forEach((t) => t.stop());
+      // Use ref — always has the latest stream, no stale closure
+      cameraStreamRef.current?.getTracks().forEach((t) => t.stop());
       if (document.fullscreenElement) await document.exitFullscreen().catch(() => {});
       navigate("/interviewee");
     },
-    [interviewId, user, cameraStream, navigate]
+    [interviewId, user, navigate]
   );
 
   // ── Add a warning; terminate immediately if count reaches 3 ──
@@ -599,7 +599,7 @@ export default function IntervieweeSession() {
   const handlePermissionsGranted = useCallback(
     async (stream: MediaStream) => {
       setCameraStream(stream);
-      setPermissionsGranted(true);
+      cameraStreamRef.current = stream;
 
       try {
         const recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
