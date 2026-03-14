@@ -600,6 +600,7 @@ export default function IntervieweeSession() {
     async (stream: MediaStream) => {
       setCameraStream(stream);
       cameraStreamRef.current = stream;
+      setPermissionsGranted(true);
 
       try {
         const recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
