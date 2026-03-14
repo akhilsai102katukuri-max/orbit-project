@@ -79,9 +79,8 @@ function PermissionScreen({ onGranted }: { onGranted: (stream: MediaStream) => v
 // TF-IDF inspired keyword scoring — much fairer than pure word match
 function scoreAnswer(expected: string, given: string): number {
   if (!given || !given.trim()) return 0;
-  if (!expected || !expected.trim()) return given.trim().length > 0 ? 50 : 0;
+  if (!expected || !expected.trim()) return given.trim().length > 0 ? 60 : 0;
 
-  // Stopwords to ignore
   const stopwords = new Set([
     "a","an","the","is","are","was","were","be","been","being","have","has","had",
     "do","does","did","will","would","could","should","may","might","shall","can",
@@ -102,35 +101,54 @@ function scoreAnswer(expected: string, given: string): number {
   const expectedKeywords = normalize(expected);
   const givenWords = normalize(given);
 
-  if (expectedKeywords.length === 0) return givenWords.length > 5 ? 60 : 30;
+  if (expectedKeywords.length === 0) return givenWords.length > 3 ? 70 : 40;
 
-  // Count exact keyword matches
   const givenSet = new Set(givenWords);
+
+  // Exact matches
   let exactMatches = 0;
   for (const kw of expectedKeywords) {
     if (givenSet.has(kw)) exactMatches++;
   }
 
-  // Partial/stem matching — e.g. "computing" matches "compute"
+  // Stem/partial matches — 70% prefix overlap counts as match
   let partialMatches = 0;
   for (const kw of expectedKeywords) {
-    if (givenSet.has(kw)) continue; // already counted
+    if (givenSet.has(kw)) continue;
     for (const gw of givenWords) {
-      if (
-        (kw.length > 4 && gw.startsWith(kw.slice(0, Math.ceil(kw.length * 0.7)))) ||
-        (gw.length > 4 && kw.startsWith(gw.slice(0, Math.ceil(gw.length * 0.7))))
-      ) {
+      const minLen = Math.min(kw.length, gw.length);
+      if (minLen < 3) continue;
+      const prefixLen = Math.ceil(minLen * 0.7);
+      if (kw.slice(0, prefixLen) === gw.slice(0, prefixLen)) {
         partialMatches++;
         break;
       }
     }
   }
 
-  // Length bonus — reward detailed answers (up to 10 bonus points)
-  const lengthBonus = Math.min(10, Math.floor(givenWords.length / 5));
+  // Synonym/concept pairs — boost score when candidate uses equivalent terms
+  const synonymPairs: [string, string][] = [
+    ["object","oop"],["oriented","class"],["inheritance","extend"],
+    ["polymorphism","override"],["encapsulation","private"],
+    ["abstraction","abstract"],["function","method"],["array","list"],
+    ["loop","iterate"],["variable","store"],["memory","ram"],
+    ["database","db"],["sql","query"],["server","backend"],
+    ["client","frontend"],["network","internet"],["protocol","http"],
+    ["class","object"],["compile","build"],["runtime","execute"],
+  ];
+  let synonymBonus = 0;
+  for (const [a, b] of synonymPairs) {
+    const expHas = expectedKeywords.includes(a) || expectedKeywords.includes(b);
+    const givHas = givenSet.has(a) || givenSet.has(b);
+    if (expHas && givHas) synonymBonus += 0.5;
+  }
 
-  const baseScore =
-    ((exactMatches + partialMatches * 0.6) / expectedKeywords.length) * 90;
+  // Length/detail bonus — longer detailed answer gets up to 15 bonus points
+  const lengthBonus = Math.min(15, givenWords.length * 0.8);
+
+  // Base: exact + partial weighted, scaled to 85
+  const matchRatio = (exactMatches + partialMatches * 0.7 + synonymBonus) / expectedKeywords.length;
+  const baseScore = matchRatio * 85;
 
   return Math.min(100, Math.round(baseScore + lengthBonus));
 }
@@ -440,16 +458,19 @@ export default function IntervieweeSession() {
   const gazeCountRef = useRef(0);
 
   // ── Fullscreen helper ──
+  const [showFullscreenOverlay, setShowFullscreenOverlay] = useState(false);
+
   const enterFullscreen = useCallback(async () => {
     try {
       await document.documentElement.requestFullscreen();
       setIsFullscreen(true);
+      setShowFullscreenOverlay(false);
     } catch {
       toast.error("Please allow fullscreen for this interview.");
     }
   }, []);
 
-  // ── Terminate session (mark DB + stop everything) ──
+  // ── Terminate session (mark DB + save recording + stop everything) ──
   const terminateSession = useCallback(
     async (reason: string) => {
       if (terminatedRef.current) return;
@@ -462,6 +483,21 @@ export default function IntervieweeSession() {
           .update({ status: "terminated" })
           .eq("interview_id", interviewId)
           .eq("user_id", user.id);
+      }
+
+      // Save recording even on termination
+      try {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+          mediaRecorderRef.current.stop();
+          await new Promise((r) => setTimeout(r, 800));
+        }
+        if (recordedChunksRef.current.length > 0 && user?.id && interviewId) {
+          const blob = new Blob(recordedChunksRef.current, { type: "video/webm" });
+          const filePath = `${user.id}/${interviewId}_${Date.now()}.webm`;
+          await supabase.storage.from("interview-recordings").upload(filePath, blob);
+        }
+      } catch (uploadErr) {
+        console.warn("Recording upload on termination failed:", uploadErr);
       }
 
       toast.error(reason, { duration: 8000 });
@@ -629,15 +665,14 @@ export default function IntervieweeSession() {
         setIsFullscreen(false);
         // Add the warning (will terminate at 3)
         addWarning("Fullscreen exit detected!");
-
-        // Auto-return to fullscreen after 1.5 s (unless already terminated)
-        setTimeout(() => {
-          if (!terminatedRef.current && !document.fullscreenElement) {
-            enterFullscreen();
-          }
-        }, 1500);
+        // Show fullscreen overlay immediately — user must click to re-enter
+        // (browsers require a direct user gesture to call requestFullscreen)
+        if (!terminatedRef.current) {
+          setShowFullscreenOverlay(true);
+        }
       } else {
         setIsFullscreen(true);
+        setShowFullscreenOverlay(false);
       }
     };
 
@@ -812,6 +847,29 @@ export default function IntervieweeSession() {
   const progress = questions.length > 0 ? ((currentIndex + 1) / questions.length) * 100 : 0;
 
   if (!permissionsGranted) return <PermissionScreen onGranted={handlePermissionsGranted} />;
+
+  // Fullscreen overlay — blocks the entire screen, forces user to click back in
+  if (showFullscreenOverlay && !terminatedRef.current) {
+    return (
+      <div
+        className="fixed inset-0 z-[9999] bg-black flex flex-col items-center justify-center gap-6 text-white"
+        style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0 }}
+      >
+        <ShieldAlert className="h-16 w-16 text-red-400" />
+        <h2 className="text-2xl font-bold text-red-400">⚠️ Fullscreen Exited!</h2>
+        <p className="text-lg text-gray-300">Warning {warningCount}/3 — You must return to fullscreen to continue.</p>
+        <p className="text-sm text-gray-400">Exiting fullscreen 3 times will terminate your interview.</p>
+        <Button
+          size="lg"
+          className="bg-red-500 hover:bg-red-600 text-white text-lg px-8 py-4 mt-2"
+          onClick={enterFullscreen}
+        >
+          <Maximize className="h-5 w-5 mr-2" />
+          Return to Fullscreen
+        </Button>
+      </div>
+    );
+  }
 
   return (
     <div ref={sessionRef} className="space-y-4 animate-fade-in select-none">
