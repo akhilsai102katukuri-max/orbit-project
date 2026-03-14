@@ -508,7 +508,7 @@ export default function IntervieweeSession() {
     [interviewId, user, cameraStream, navigate]
   );
 
-  // ── Add a warning; terminate if count reaches 3 ──
+  // ── Add a warning; terminate immediately if count reaches 3 ──
   const addWarning = useCallback(
     (message: string) => {
       if (terminatedRef.current) return;
@@ -517,6 +517,7 @@ export default function IntervieweeSession() {
       setWarningCount(next);
 
       if (next >= 3) {
+        // Terminate immediately — don't wait for state re-render
         terminateSession("Interview terminated due to repeated violations.");
       } else {
         toast.warning(`⚠️ ${message} Warning ${next}/3`, { duration: 5000 });
@@ -848,31 +849,44 @@ export default function IntervieweeSession() {
 
   if (!permissionsGranted) return <PermissionScreen onGranted={handlePermissionsGranted} />;
 
-  // Fullscreen overlay — blocks the entire screen, forces user to click back in
-  if (showFullscreenOverlay && !terminatedRef.current) {
-    return (
-      <div
-        className="fixed inset-0 z-[9999] bg-black flex flex-col items-center justify-center gap-6 text-white"
-        style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0 }}
-      >
-        <ShieldAlert className="h-16 w-16 text-red-400" />
-        <h2 className="text-2xl font-bold text-red-400">⚠️ Fullscreen Exited!</h2>
-        <p className="text-lg text-gray-300">Warning {warningCount}/3 — You must return to fullscreen to continue.</p>
-        <p className="text-sm text-gray-400">Exiting fullscreen 3 times will terminate your interview.</p>
-        <Button
-          size="lg"
-          className="bg-red-500 hover:bg-red-600 text-white text-lg px-8 py-4 mt-2"
-          onClick={enterFullscreen}
-        >
-          <Maximize className="h-5 w-5 mr-2" />
-          Return to Fullscreen
-        </Button>
-      </div>
-    );
-  }
+
 
   return (
     <div ref={sessionRef} className="space-y-4 animate-fade-in select-none">
+      {/* Fullscreen overlay — fixed position so camera/video keeps running underneath */}
+      {showFullscreenOverlay && !terminatedRef.current && (
+        <div
+          style={{
+            position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
+            zIndex: 9999, background: "rgba(0,0,0,0.96)",
+            display: "flex", flexDirection: "column",
+            alignItems: "center", justifyContent: "center", gap: "24px",
+          }}
+        >
+          <ShieldAlert style={{ width: 64, height: 64, color: "#f87171" }} />
+          <h2 style={{ fontSize: 28, fontWeight: 700, color: "#f87171", margin: 0 }}>
+            ⚠️ Fullscreen Exited!
+          </h2>
+          <p style={{ fontSize: 18, color: "#d1d5db", margin: 0 }}>
+            Warning {warningCount}/3 — You must return to fullscreen to continue.
+          </p>
+          <p style={{ fontSize: 14, color: "#9ca3af", margin: 0 }}>
+            Exiting fullscreen 3 times will permanently terminate your interview.
+          </p>
+          <button
+            onClick={enterFullscreen}
+            style={{
+              marginTop: 8, padding: "14px 36px", fontSize: 18, fontWeight: 600,
+              background: "#ef4444", color: "white", border: "none",
+              borderRadius: 8, cursor: "pointer", display: "flex",
+              alignItems: "center", gap: 10,
+            }}
+          >
+            <Maximize style={{ width: 20, height: 20 }} />
+            Return to Fullscreen
+          </button>
+        </div>
+      )}
       {warningCount > 0 && (
         <div className="bg-destructive/10 border border-destructive/30 rounded-lg p-3 flex items-center gap-2">
           <ShieldAlert className="h-4 w-4 text-destructive flex-shrink-0" />
