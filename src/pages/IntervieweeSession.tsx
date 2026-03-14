@@ -76,14 +76,63 @@ function PermissionScreen({ onGranted }: { onGranted: (stream: MediaStream) => v
   );
 }
 
-// FIX 2: Word-to-word comparison scoring (no Gemini)
+// TF-IDF inspired keyword scoring — much fairer than pure word match
 function scoreAnswer(expected: string, given: string): number {
-  if (!given.trim()) return 0;
-  const expectedWords = expected.toLowerCase().split(/\s+/).filter(Boolean);
-  const givenWords = given.toLowerCase().split(/\s+/).filter(Boolean);
-  if (expectedWords.length === 0) return givenWords.length > 0 ? 100 : 0;
-  const matches = expectedWords.filter((w) => givenWords.includes(w)).length;
-  return Math.min(100, Math.round((matches / expectedWords.length) * 100));
+  if (!given || !given.trim()) return 0;
+  if (!expected || !expected.trim()) return given.trim().length > 0 ? 50 : 0;
+
+  // Stopwords to ignore
+  const stopwords = new Set([
+    "a","an","the","is","are","was","were","be","been","being","have","has","had",
+    "do","does","did","will","would","could","should","may","might","shall","can",
+    "to","of","in","for","on","with","at","by","from","and","or","but","if","as",
+    "it","its","this","that","these","those","i","you","he","she","we","they",
+    "what","which","who","how","when","where","why","not","no","yes","so","very",
+    "just","also","than","then","there","here","more","some","any","all","each",
+    "about","into","through","during","before","after","above","below","between",
+  ]);
+
+  const normalize = (text: string) =>
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length > 1 && !stopwords.has(w));
+
+  const expectedKeywords = normalize(expected);
+  const givenWords = normalize(given);
+
+  if (expectedKeywords.length === 0) return givenWords.length > 5 ? 60 : 30;
+
+  // Count exact keyword matches
+  const givenSet = new Set(givenWords);
+  let exactMatches = 0;
+  for (const kw of expectedKeywords) {
+    if (givenSet.has(kw)) exactMatches++;
+  }
+
+  // Partial/stem matching — e.g. "computing" matches "compute"
+  let partialMatches = 0;
+  for (const kw of expectedKeywords) {
+    if (givenSet.has(kw)) continue; // already counted
+    for (const gw of givenWords) {
+      if (
+        (kw.length > 4 && gw.startsWith(kw.slice(0, Math.ceil(kw.length * 0.7)))) ||
+        (gw.length > 4 && kw.startsWith(gw.slice(0, Math.ceil(gw.length * 0.7))))
+      ) {
+        partialMatches++;
+        break;
+      }
+    }
+  }
+
+  // Length bonus — reward detailed answers (up to 10 bonus points)
+  const lengthBonus = Math.min(10, Math.floor(givenWords.length / 5));
+
+  const baseScore =
+    ((exactMatches + partialMatches * 0.6) / expectedKeywords.length) * 90;
+
+  return Math.min(100, Math.round(baseScore + lengthBonus));
 }
 
 function getScores(
@@ -91,13 +140,14 @@ function getScores(
   answers: Record<string, string>
 ): { score: number; feedback: string }[] {
   return questions.map((q) => {
-    const given = answers[q.id] || "";
+    const given = (answers[q.id] || "").trim();
     const score = scoreAnswer(q.expected_answer, given);
-    let feedback = "Score based on answer relevance to expected response.";
-    if (!given.trim()) feedback = "No answer provided.";
-    else if (score >= 80) feedback = "Excellent answer covering key points.";
-    else if (score >= 50) feedback = "Good answer but missing some key points.";
-    else if (score > 0) feedback = "Answer partially matches expected response.";
+    let feedback = "Score based on keyword relevance to expected response.";
+    if (!given) feedback = "No answer provided.";
+    else if (score >= 85) feedback = "Excellent — covered all key concepts.";
+    else if (score >= 65) feedback = "Good answer, covered most key points.";
+    else if (score >= 40) feedback = "Partial answer — some key concepts missing.";
+    else if (score > 0) feedback = "Answer lacks key concepts from expected response.";
     else feedback = "Answer does not match expected response.";
     return { score, feedback };
   });
@@ -136,7 +186,6 @@ async function analyzeFrame(
       onViolations(result.violations);
       for (const v of result.violations) {
         if (v.severity === "high") onHighSeverity();
-        // FIX 4: trigger gaze counter for gaze_away violations
         if (v.type === "gaze_away") onGazeAway();
         await (supabase as any).from("proctoring_logs").insert({
           interview_id: interviewId,
@@ -148,35 +197,65 @@ async function analyzeFrame(
       }
     }
   } catch {
-    // API not running — silently ignore
+    // API offline — silently ignore
   }
 }
 
-// FIX 1: Fixed VoiceAnswer — proper ref-based transcript to avoid stale closure
-function VoiceAnswer({ questionId, value, onChange }: { questionId: string; value: string; onChange: (id: string, text: string) => void }) {
+// ─── VoiceAnswer ──────────────────────────────────────────────────────────────
+// FIX: uses a ref-based accumulator to prevent duplicate/stale transcript issues.
+// Speech recognition interim results are shown live but NOT appended to the
+// stored answer — only final results are appended, each segment exactly once.
+function VoiceAnswer({
+  questionId,
+  value,
+  onChange,
+}: {
+  questionId: string;
+  value: string;
+  onChange: (id: string, text: string) => void;
+}) {
   const [isRecording, setIsRecording] = useState(false);
   const [supported, setSupported] = useState(true);
+  const [interimText, setInterimText] = useState("");
   const recognitionRef = useRef<any>(null);
   const isRecordingRef = useRef(false);
-  const finalTranscriptRef = useRef(value);
+  // Accumulates only final segments — never re-reads `value` from closure
+  const finalAccRef = useRef<string>("");
 
-  // Keep ref in sync with prop value
+  // Keep accumulator in sync when question changes (user navigates away)
   useEffect(() => {
-    finalTranscriptRef.current = value;
-  }, [value]);
+    // Stop any ongoing recording when question changes
+    if (isRecordingRef.current) {
+      isRecordingRef.current = false;
+      recognitionRef.current?.stop();
+      setIsRecording(false);
+    }
+    finalAccRef.current = value ?? "";
+    setInterimText("");
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [questionId]);
 
   useEffect(() => {
-    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    const SR =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SR) setSupported(false);
     return () => {
-      recognitionRef.current?.stop();
       isRecordingRef.current = false;
+      recognitionRef.current?.stop();
     };
   }, []);
 
   const startRecording = () => {
-    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SR) { toast.error("Speech recognition not supported. Use Chrome."); return; }
+    const SR =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) {
+      toast.error("Speech recognition not supported. Use Chrome.");
+      return;
+    }
+
+    // Sync accumulator with current saved value before starting
+    finalAccRef.current = value ?? "";
+
     const recognition = new SR();
     recognition.continuous = true;
     recognition.interimResults = true;
@@ -187,38 +266,53 @@ function VoiceAnswer({ questionId, value, onChange }: { questionId: string; valu
       let interim = "";
       for (let i = event.resultIndex; i < event.results.length; i++) {
         if (event.results[i].isFinal) {
-          let bestTranscript = event.results[i][0].transcript;
-          let bestConfidence = event.results[i][0].confidence || 0;
+          // Pick highest-confidence alternative
+          let best = event.results[i][0].transcript;
+          let bestConf = event.results[i][0].confidence ?? 0;
           for (let j = 1; j < event.results[i].length; j++) {
-            if ((event.results[i][j].confidence || 0) > bestConfidence) {
-              bestConfidence = event.results[i][j].confidence;
-              bestTranscript = event.results[i][j].transcript;
+            const conf = event.results[i][j].confidence ?? 0;
+            if (conf > bestConf) {
+              bestConf = conf;
+              best = event.results[i][j].transcript;
             }
           }
-          finalTranscriptRef.current = (finalTranscriptRef.current ? finalTranscriptRef.current + " " : "") + bestTranscript.trim();
+          const segment = best.trim();
+          if (segment) {
+            // Append to accumulator — no stale closure, no duplication
+            finalAccRef.current = finalAccRef.current
+              ? finalAccRef.current + " " + segment
+              : segment;
+            onChange(questionId, finalAccRef.current);
+          }
+          interim = "";
         } else {
           interim = event.results[i][0].transcript;
         }
       }
-      // FIX 1: use ref value — no stale closure issue
-      onChange(questionId, finalTranscriptRef.current + (interim ? " " + interim : ""));
+      setInterimText(interim);
     };
 
     recognition.onerror = (e: any) => {
       if (e.error === "no-speech") {
         if (isRecordingRef.current) {
-          try { recognitionRef.current?.start(); } catch {}
+          try {
+            recognitionRef.current?.start();
+          } catch {}
         }
       } else if (e.error !== "aborted") {
         toast.error(`Speech error: ${e.error}`);
         setIsRecording(false);
         isRecordingRef.current = false;
+        setInterimText("");
       }
     };
 
     recognition.onend = () => {
+      setInterimText("");
       if (isRecordingRef.current) {
-        try { recognitionRef.current.start(); } catch {}
+        try {
+          recognitionRef.current.start();
+        } catch {}
       } else {
         setIsRecording(false);
       }
@@ -235,27 +329,86 @@ function VoiceAnswer({ questionId, value, onChange }: { questionId: string; valu
     isRecordingRef.current = false;
     recognitionRef.current?.stop();
     setIsRecording(false);
+    setInterimText("");
     toast.success("Recording stopped", { id: "rec-stop" });
   };
 
-  if (!supported) return <div className="p-4 rounded-lg bg-destructive/10 border border-destructive/20 text-sm text-destructive">Speech recognition not supported. Use Google Chrome.</div>;
+  const clearAnswer = () => {
+    finalAccRef.current = "";
+    onChange(questionId, "");
+    setInterimText("");
+  };
+
+  if (!supported)
+    return (
+      <div className="p-4 rounded-lg bg-destructive/10 border border-destructive/20 text-sm text-destructive">
+        Speech recognition not supported. Please use Google Chrome.
+      </div>
+    );
+
+  // What we display: saved final text + live interim (interim shown in a lighter style)
+  const displayText = value || "";
 
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-3">
-        <Button type="button" variant={isRecording ? "destructive" : "outline"} onClick={isRecording ? stopRecording : startRecording} className={`gap-2 ${isRecording ? "animate-pulse" : ""}`}>
-          {isRecording ? <><MicOff className="h-4 w-4" /> Stop Recording</> : <><Mic className="h-4 w-4" /> Start Recording</>}
+        <Button
+          type="button"
+          variant={isRecording ? "destructive" : "outline"}
+          onClick={isRecording ? stopRecording : startRecording}
+          className={`gap-2 ${isRecording ? "animate-pulse" : ""}`}
+        >
+          {isRecording ? (
+            <>
+              <MicOff className="h-4 w-4" /> Stop Recording
+            </>
+          ) : (
+            <>
+              <Mic className="h-4 w-4" /> Start Recording
+            </>
+          )}
         </Button>
-        {isRecording && <div className="flex items-center gap-1.5 text-sm text-destructive font-medium"><div className="h-2 w-2 rounded-full bg-destructive animate-pulse" />Recording…</div>}
+        {isRecording && (
+          <div className="flex items-center gap-1.5 text-sm text-destructive font-medium">
+            <div className="h-2 w-2 rounded-full bg-destructive animate-pulse" />
+            Recording…
+          </div>
+        )}
       </div>
+
       <div className="min-h-[150px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground overflow-y-auto whitespace-pre-wrap">
-        {value || <span className="text-muted-foreground">Press "Start Recording" and speak your answer.</span>}
+        {displayText ? (
+          <>
+            <span>{displayText}</span>
+            {interimText && (
+              <span className="text-muted-foreground italic"> {interimText}</span>
+            )}
+          </>
+        ) : interimText ? (
+          <span className="text-muted-foreground italic">{interimText}</span>
+        ) : (
+          <span className="text-muted-foreground">
+            Press "Start Recording" and speak your answer.
+          </span>
+        )}
       </div>
-      {value && <Button type="button" variant="ghost" size="sm" className="text-muted-foreground text-xs" onClick={() => { finalTranscriptRef.current = ""; onChange(questionId, ""); }}>Clear answer</Button>}
+
+      {displayText && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="text-muted-foreground text-xs"
+          onClick={clearAnswer}
+        >
+          Clear answer
+        </Button>
+      )}
     </div>
   );
 }
 
+// ─── Main Component ───────────────────────────────────────────────────────────
 export default function IntervieweeSession() {
   const { interviewId } = useParams();
   const { user } = useAuth();
@@ -275,71 +428,97 @@ export default function IntervieweeSession() {
   const [aiViolations, setAiViolations] = useState<Violation[]>([]);
   const [apiConnected, setApiConnected] = useState(false);
   const [timeLeft, setTimeLeft] = useState<number>(30 * 60);
+
+  // Use a ref for warningCount so callbacks always see fresh value
+  const warningCountRef = useRef(0);
+  const terminatedRef = useRef(false); // prevent double-terminate
+
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
 
-  // FIX 4: gaze away counter — 3 gaze detections = 1 warning
+  // Gaze counter: every 3 gaze_away detections = 1 warning
   const gazeCountRef = useRef(0);
 
-  const handleProctoringTerminate = useCallback(async () => {
-    if (interviewId) {
-      await (supabase as any).from("interview_participants")
-        .update({ status: "terminated" })
-        .eq("interview_id", interviewId)
-        .eq("user_id", user?.id);
+  // ── Fullscreen helper ──
+  const enterFullscreen = useCallback(async () => {
+    try {
+      await document.documentElement.requestFullscreen();
+      setIsFullscreen(true);
+    } catch {
+      toast.error("Please allow fullscreen for this interview.");
     }
-    cameraStream?.getTracks().forEach((t) => t.stop());
-    if (document.fullscreenElement) await document.exitFullscreen().catch(() => {});
-    navigate("/interviewee");
-  }, [interviewId, cameraStream, navigate, user]);
+  }, []);
 
-  const handleHighSeverityViolation = useCallback(() => {
-    setWarningCount((c) => {
-      const next = c + 1;
-      if (next >= 3) {
-        toast.error("Interview terminated due to proctoring violations.", { duration: 8000 });
-        handleProctoringTerminate();
-      } else {
-        toast.warning(`⚠️ Proctoring violation! Warning ${next}/3`, { duration: 4000 });
+  // ── Terminate session (mark DB + stop everything) ──
+  const terminateSession = useCallback(
+    async (reason: string) => {
+      if (terminatedRef.current) return;
+      terminatedRef.current = true;
+
+      // Mark as terminated in DB so the candidate cannot rejoin
+      if (interviewId && user?.id) {
+        await (supabase as any)
+          .from("interview_participants")
+          .update({ status: "terminated" })
+          .eq("interview_id", interviewId)
+          .eq("user_id", user.id);
       }
-      return next;
-    });
-  }, [handleProctoringTerminate]);
 
-  // FIX 4: every 3 gaze detections = 1 warning
+      toast.error(reason, { duration: 8000 });
+      cameraStream?.getTracks().forEach((t) => t.stop());
+      if (document.fullscreenElement) await document.exitFullscreen().catch(() => {});
+      navigate("/interviewee");
+    },
+    [interviewId, user, cameraStream, navigate]
+  );
+
+  // ── Add a warning; terminate if count reaches 3 ──
+  const addWarning = useCallback(
+    (message: string) => {
+      if (terminatedRef.current) return;
+      const next = warningCountRef.current + 1;
+      warningCountRef.current = next;
+      setWarningCount(next);
+
+      if (next >= 3) {
+        terminateSession("Interview terminated due to repeated violations.");
+      } else {
+        toast.warning(`⚠️ ${message} Warning ${next}/3`, { duration: 5000 });
+      }
+    },
+    [terminateSession]
+  );
+
+  // ── High severity AI violation ──
+  const handleHighSeverityViolation = useCallback(() => {
+    addWarning("Proctoring violation detected!");
+  }, [addWarning]);
+
+  // ── Gaze away — 3 detections = 1 warning ──
   const handleGazeAway = useCallback(() => {
     gazeCountRef.current += 1;
     if (gazeCountRef.current >= 3) {
       gazeCountRef.current = 0;
-      setWarningCount((c) => {
-        const next = c + 1;
-        if (next >= 3) {
-          toast.error("Interview terminated due to repeated gaze violations.", { duration: 8000 });
-          handleProctoringTerminate();
-        } else {
-          toast.warning(`⚠️ Gaze warning! Looking away too often. Warning ${next}/3`, { duration: 4000 });
-        }
-        return next;
-      });
+      addWarning("Looking away from screen too often.");
     }
-  }, [handleProctoringTerminate]);
+  }, [addWarning]);
 
   const { multipleFaces, multipleVoices, faceCount } = useProctoring({
-    videoRef, stream: cameraStream, enabled: permissionsGranted, onTerminate: handleProctoringTerminate,
+    videoRef,
+    stream: cameraStream,
+    enabled: permissionsGranted,
+    onTerminate: () => terminateSession("Interview terminated due to proctoring violations."),
   });
 
-  const enterFullscreen = useCallback(async () => {
-    try { await document.documentElement.requestFullscreen(); setIsFullscreen(true); }
-    catch { toast.error("Please allow fullscreen for this interview."); }
-  }, []);
-
+  // ── Health check ──
   useEffect(() => {
     fetch("https://akhilsai-328-orbit-proctoring-api.hf.space/health")
-      .then(r => r.json())
-      .then(d => { if (d.status === "running") setApiConnected(true); })
+      .then((r) => r.json())
+      .then((d) => { if (d.status === "running") setApiConnected(true); })
       .catch(() => setApiConnected(false));
   }, []);
 
+  // ── Frame analysis loop ──
   useEffect(() => {
     if (!permissionsGranted || !cameraStream || !interviewId || !user) return;
     if (!apiConnected) return;
@@ -354,13 +533,14 @@ export default function IntervieweeSession() {
           setTimeout(() => setAiViolations([]), 8000);
         },
         handleHighSeverityViolation,
-        handleGazeAway   // FIX 4
+        handleGazeAway
       );
     }, 2000);
 
     return () => clearInterval(interval);
   }, [permissionsGranted, cameraStream, interviewId, user, apiConnected, handleHighSeverityViolation, handleGazeAway]);
 
+  // ── Timer ──
   useEffect(() => {
     if (!permissionsGranted || timeLeft === 0) return;
     const timer = setInterval(() => {
@@ -375,67 +555,84 @@ export default function IntervieweeSession() {
       });
     }, 1000);
     return () => clearInterval(timer);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [permissionsGranted]);
 
-  const handlePermissionsGranted = useCallback(async (stream: MediaStream) => {
-    setCameraStream(stream);
-    setPermissionsGranted(true);
-    try {
-      const recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
-      recordedChunksRef.current = [];
-      recorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunksRef.current.push(e.data); };
-      recorder.start(1000);
-      mediaRecorderRef.current = recorder;
-    } catch (err) { console.warn("Video recording not supported:", err); }
+  // ── Permissions granted handler ──
+  const handlePermissionsGranted = useCallback(
+    async (stream: MediaStream) => {
+      setCameraStream(stream);
+      setPermissionsGranted(true);
 
-    if (user && interviewId) {
-      const { data: profileData } = await (supabase as any)
-        .from("profiles").select("full_name").eq("id", user.id).maybeSingle();
-      const candidateName = profileData?.full_name || user.email || "Unknown";
+      try {
+        const recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
+        recordedChunksRef.current = [];
+        recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) recordedChunksRef.current.push(e.data);
+        };
+        recorder.start(1000);
+        mediaRecorderRef.current = recorder;
+      } catch (err) {
+        console.warn("Video recording not supported:", err);
+      }
 
-      await (supabase as any).from("interview_participants").upsert({
-        interview_id: interviewId,
-        user_id: user.id,
-        candidate_name: candidateName,
-        candidate_email: user.email,
-        status: "joined",
-        joined_at: new Date().toISOString(),
-      }, { onConflict: "interview_id,user_id" });
-    }
-    await enterFullscreen();
-  }, [enterFullscreen, user, interviewId]);
+      if (user && interviewId) {
+        const { data: profileData } = await (supabase as any)
+          .from("profiles")
+          .select("full_name")
+          .eq("id", user.id)
+          .maybeSingle();
+        const candidateName = profileData?.full_name || user.email || "Unknown";
 
+        await (supabase as any).from("interview_participants").upsert(
+          {
+            interview_id: interviewId,
+            user_id: user.id,
+            candidate_name: candidateName,
+            candidate_email: user.email,
+            status: "joined",
+            joined_at: new Date().toISOString(),
+          },
+          { onConflict: "interview_id,user_id" }
+        );
+      }
+      await enterFullscreen();
+    },
+    [enterFullscreen, user, interviewId]
+  );
+
+  // ── Block copy/paste/F11; Escape key → re-enter fullscreen ──
   useEffect(() => {
     if (!permissionsGranted) return;
     const block = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && ["c", "v", "x", "a"].includes(e.key.toLowerCase())) {
-        e.preventDefault(); toast.warning("Copy/paste is disabled.", { id: "copy-paste" });
+        e.preventDefault();
+        toast.warning("Copy/paste is disabled.", { id: "copy-paste" });
       }
       if (e.key === "F11") e.preventDefault();
-      if (e.key === "Escape") { e.preventDefault(); enterFullscreen(); }
+      // Escape: browser will exit fullscreen before this fires, so we handle
+      // it in fullscreenchange below. Just prevent default here.
+      if (e.key === "Escape") {
+        e.preventDefault();
+      }
     };
     window.addEventListener("keydown", block, true);
     return () => window.removeEventListener("keydown", block, true);
-  }, [permissionsGranted, enterFullscreen]);
+  }, [permissionsGranted]);
 
-  // FIX 3: auto return to fullscreen after warning
+  // ── Fullscreen exit → add warning + auto-return ──
   useEffect(() => {
     if (!permissionsGranted) return;
+
     const handleFsChange = () => {
       if (!document.fullscreenElement) {
         setIsFullscreen(false);
-        setWarningCount((c) => {
-          const next = c + 1;
-          toast.warning(`⚠️ Fullscreen exit! Warning ${next}/3`, { duration: 5000 });
-          if (next >= 3) {
-            toast.error("Interview terminated.", { duration: 8000 });
-            navigate("/interviewee");
-          }
-          return next;
-        });
-        // FIX 3: auto return to fullscreen after 1.5 seconds
+        // Add the warning (will terminate at 3)
+        addWarning("Fullscreen exit detected!");
+
+        // Auto-return to fullscreen after 1.5 s (unless already terminated)
         setTimeout(() => {
-          if (!document.fullscreenElement) {
+          if (!terminatedRef.current && !document.fullscreenElement) {
             enterFullscreen();
           }
         }, 1500);
@@ -443,33 +640,33 @@ export default function IntervieweeSession() {
         setIsFullscreen(true);
       }
     };
+
     document.addEventListener("fullscreenchange", handleFsChange);
     return () => document.removeEventListener("fullscreenchange", handleFsChange);
-  }, [permissionsGranted, enterFullscreen, navigate]);
+  }, [permissionsGranted, enterFullscreen, addWarning]);
 
+  // ── Tab switch detection ──
   useEffect(() => {
     if (!permissionsGranted) return;
     const handleVisibility = () => {
       if (document.hidden) {
         if (user && interviewId) {
           (supabase as any).from("proctoring_logs").insert({
-            interview_id: interviewId, user_id: user.id,
-            event_type: "tab_switch", severity: "medium",
+            interview_id: interviewId,
+            user_id: user.id,
+            event_type: "tab_switch",
+            severity: "medium",
             details: "Candidate switched browser tab",
           });
         }
-        setWarningCount((c) => {
-          const next = c + 1;
-          toast.warning(`⚠️ Tab switch detected! Warning ${next}/3`, { duration: 5000 });
-          if (next >= 3) { toast.error("Too many violations. Terminated.", { duration: 8000 }); navigate("/interviewee"); }
-          return next;
-        });
+        addWarning("Tab switch detected!");
       }
     };
     document.addEventListener("visibilitychange", handleVisibility);
     return () => document.removeEventListener("visibilitychange", handleVisibility);
-  }, [permissionsGranted, navigate, user, interviewId]);
+  }, [permissionsGranted, user, interviewId, addWarning]);
 
+  // ── Block right-click ──
   useEffect(() => {
     if (!permissionsGranted) return;
     const block = (e: MouseEvent) => e.preventDefault();
@@ -477,10 +674,12 @@ export default function IntervieweeSession() {
     return () => document.removeEventListener("contextmenu", block);
   }, [permissionsGranted]);
 
+  // ── Attach camera stream to video element ──
   useEffect(() => {
     if (videoRef.current && cameraStream) videoRef.current.srcObject = cameraStream;
   }, [cameraStream, permissionsGranted]);
 
+  // ── Cleanup on unmount ──
   useEffect(() => {
     return () => {
       cameraStream?.getTracks().forEach((t) => t.stop());
@@ -488,6 +687,7 @@ export default function IntervieweeSession() {
     };
   }, [cameraStream]);
 
+  // ── Load questions + check if already terminated/completed ──
   useEffect(() => {
     const fetchQuestions = async () => {
       if (user) {
@@ -497,6 +697,7 @@ export default function IntervieweeSession() {
           .eq("interview_id", interviewId)
           .eq("user_id", user.id)
           .maybeSingle();
+
         if (participant?.status === "terminated") {
           toast.error("You have been terminated from this interview and cannot rejoin.");
           navigate("/interviewee");
@@ -508,18 +709,27 @@ export default function IntervieweeSession() {
           return;
         }
       }
-      const { data: interview } = await (supabase as any).from("interviews").select("title, time_limit_minutes").eq("id", interviewId).single();
+
+      const { data: interview } = await (supabase as any)
+        .from("interviews")
+        .select("title, time_limit_minutes")
+        .eq("id", interviewId)
+        .single();
+
       if (interview) {
         setInterviewTitle(interview.title);
-        const mins = interview.time_limit_minutes || 30;
-        setTimeLeft(mins * 60);
+        setTimeLeft((interview.time_limit_minutes || 30) * 60);
       }
-      const { data } = await (supabase as any).from("interview_questions")
+
+      const { data } = await (supabase as any)
+        .from("interview_questions")
         .select("id, question_number, question_text, expected_answer")
         .eq("interview_id", interviewId)
         .order("question_number", { ascending: true });
+
       if (data) setQuestions(data);
     };
+
     if (interviewId) fetchQuestions();
   }, [interviewId, user, navigate]);
 
@@ -532,34 +742,36 @@ export default function IntervieweeSession() {
     setSubmitting(true);
     try {
       const { data: profileData } = await (supabase as any)
-        .from("profiles").select("full_name").eq("id", user.id).maybeSingle();
+        .from("profiles")
+        .select("full_name")
+        .eq("id", user.id)
+        .maybeSingle();
       const userName = profileData?.full_name || user.email || "Unknown";
 
-      // FIX 2: use word-comparison scoring only
       toast.info("Evaluating your answers...", { id: "ai-scoring" });
       const results = getScores(questions, answers);
 
-      const { error: respError } = await (supabase as any).from("interviewee_responses").insert(
-        questions.map((q, i) => ({
-          interview_id: interviewId,
-          question_id: q.id,
-          user_id: user.id,
-          interviewee_user_id: user.id,
-          interviewee_name: userName,
-          answer_text: answers[q.id] || "",   // FIX 1: save actual answer
-          score: results[i]?.score ?? 0,
-          ai_score: results[i]?.score ?? 0,
-          feedback: results[i]?.feedback ?? "",
-          ai_feedback: results[i]?.feedback ?? "",
-          submitted_at: new Date().toISOString(),
-        }))
-      );
+      const { error: respError } = await (supabase as any)
+        .from("interviewee_responses")
+        .insert(
+          questions.map((q, i) => ({
+            interview_id: interviewId,
+            question_id: q.id,
+            user_id: user.id,
+            interviewee_user_id: user.id,
+            interviewee_name: userName,
+            answer_text: (answers[q.id] || "").trim(),
+            score: results[i]?.score ?? 0,
+            ai_score: results[i]?.score ?? 0,
+            feedback: results[i]?.feedback ?? "",
+            ai_feedback: results[i]?.feedback ?? "",
+            submitted_at: new Date().toISOString(),
+          }))
+        );
 
       if (respError) {
         console.error("Response save error:", JSON.stringify(respError));
         toast.error("Failed to save responses: " + respError.message);
-      } else {
-        console.log("Responses saved successfully for interview:", interviewId);
       }
 
       try {
@@ -570,12 +782,17 @@ export default function IntervieweeSession() {
           const filePath = `${user.id}/${interviewId}_${Date.now()}.webm`;
           await supabase.storage.from("interview-recordings").upload(filePath, blob);
         }
-      } catch (uploadErr) { console.warn("Video upload failed:", uploadErr); }
+      } catch (uploadErr) {
+        console.warn("Video upload failed:", uploadErr);
+      }
 
-      const finalScore = results.length > 0
-        ? Math.round(results.reduce((sum, r) => sum + r.score, 0) / results.length) : 0;
+      const finalScore =
+        results.length > 0
+          ? Math.round(results.reduce((sum, r) => sum + r.score, 0) / results.length)
+          : 0;
 
-      await (supabase as any).from("interview_participants")
+      await (supabase as any)
+        .from("interview_participants")
         .update({ status: "completed", final_score: finalScore })
         .eq("interview_id", interviewId)
         .eq("user_id", user.id);
@@ -601,14 +818,31 @@ export default function IntervieweeSession() {
       {warningCount > 0 && (
         <div className="bg-destructive/10 border border-destructive/30 rounded-lg p-3 flex items-center gap-2">
           <ShieldAlert className="h-4 w-4 text-destructive flex-shrink-0" />
-          <p className="text-sm text-destructive font-medium">Warning {warningCount}/3 — {3 - warningCount} remaining before termination.</p>
+          <p className="text-sm text-destructive font-medium">
+            Warning {warningCount}/3 — {3 - warningCount} remaining before termination.
+          </p>
         </div>
       )}
 
       {aiViolations.map((v, i) => (
-        <div key={i} className={`border rounded-lg p-3 flex items-center gap-2 animate-pulse ${v.severity === "high" ? "bg-destructive/10 border-destructive/30" : "bg-yellow-50 border-yellow-200"}`}>
-          <AlertTriangle className={`h-4 w-4 flex-shrink-0 ${v.severity === "high" ? "text-destructive" : "text-yellow-600"}`} />
-          <p className={`text-sm font-medium ${v.severity === "high" ? "text-destructive" : "text-yellow-700"}`}>
+        <div
+          key={i}
+          className={`border rounded-lg p-3 flex items-center gap-2 animate-pulse ${
+            v.severity === "high"
+              ? "bg-destructive/10 border-destructive/30"
+              : "bg-yellow-50 border-yellow-200"
+          }`}
+        >
+          <AlertTriangle
+            className={`h-4 w-4 flex-shrink-0 ${
+              v.severity === "high" ? "text-destructive" : "text-yellow-600"
+            }`}
+          />
+          <p
+            className={`text-sm font-medium ${
+              v.severity === "high" ? "text-destructive" : "text-yellow-700"
+            }`}
+          >
             ⚠️ AI Detection: {v.message}
           </p>
         </div>
@@ -617,7 +851,9 @@ export default function IntervieweeSession() {
       {multipleFaces && (
         <div className="bg-destructive/10 border border-destructive/30 rounded-lg p-3 flex items-center gap-2 animate-pulse">
           <Users className="h-4 w-4 text-destructive flex-shrink-0" />
-          <p className="text-sm text-destructive font-medium">⚠️ Multiple persons detected ({faceCount} faces)!</p>
+          <p className="text-sm text-destructive font-medium">
+            ⚠️ Multiple persons detected ({faceCount} faces)!
+          </p>
         </div>
       )}
       {multipleVoices && (
@@ -626,6 +862,7 @@ export default function IntervieweeSession() {
           <p className="text-sm text-destructive font-medium">⚠️ Unusual audio activity detected!</p>
         </div>
       )}
+
       {!isFullscreen && (
         <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 flex items-center justify-between gap-2">
           <div className="flex items-center gap-2">
@@ -643,16 +880,29 @@ export default function IntervieweeSession() {
           <h2 className="text-2xl font-bold">{interviewTitle || "Interview Session"}</h2>
           <div className="flex items-center gap-2 text-sm text-muted-foreground mt-1">
             <div className="h-2 w-2 rounded-full bg-green-500 animate-pulse" />
-            <span>Live Session • Question {currentIndex + 1} of {questions.length}</span>
-            <span className={"text-xs px-2 py-0.5 rounded-full font-mono " + (timeLeft < 300 ? "bg-destructive/10 text-destructive animate-pulse" : "bg-muted text-muted-foreground")}>
-              ⏱ {Math.floor(timeLeft / 60)}:{String(timeLeft % 60).padStart(2, '0')}
+            <span>
+              Live Session • Question {currentIndex + 1} of {questions.length}
+            </span>
+            <span
+              className={
+                "text-xs px-2 py-0.5 rounded-full font-mono " +
+                (timeLeft < 300
+                  ? "bg-destructive/10 text-destructive animate-pulse"
+                  : "bg-muted text-muted-foreground")
+              }
+            >
+              ⏱ {Math.floor(timeLeft / 60)}:{String(timeLeft % 60).padStart(2, "0")}
             </span>
             {apiConnected && (
-              <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full">AI Proctoring Active</span>
+              <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full">
+                AI Proctoring Active
+              </span>
             )}
           </div>
         </div>
-        <Badge variant="destructive" className="gap-1"><ShieldAlert className="h-3 w-3" /> Proctored</Badge>
+        <Badge variant="destructive" className="gap-1">
+          <ShieldAlert className="h-3 w-3" /> Proctored
+        </Badge>
       </div>
 
       <Progress value={progress} className="h-2" />
@@ -666,19 +916,41 @@ export default function IntervieweeSession() {
                 <div className="h-1.5 w-1.5 rounded-full bg-white animate-pulse" /> Recording
               </Badge>
               {apiConnected && (
-                <Badge className="absolute top-2 right-2 bg-blue-600 text-white text-xs">AI Active</Badge>
+                <Badge className="absolute top-2 right-2 bg-blue-600 text-white text-xs">
+                  AI Active
+                </Badge>
               )}
             </div>
             <CardContent className="p-3">
               <div className="grid grid-cols-2 gap-2 text-xs">
-                <div className="flex items-center gap-1.5 text-green-600"><div className="h-1.5 w-1.5 rounded-full bg-green-500" /> Camera Active</div>
-                <div className="flex items-center gap-1.5 text-green-600"><div className="h-1.5 w-1.5 rounded-full bg-green-500" /> Mic Active</div>
-                <div className={`flex items-center gap-1.5 ${isFullscreen ? "text-green-600" : "text-yellow-600"}`}>
-                  <div className={`h-1.5 w-1.5 rounded-full ${isFullscreen ? "bg-green-500" : "bg-yellow-500"}`} />
+                <div className="flex items-center gap-1.5 text-green-600">
+                  <div className="h-1.5 w-1.5 rounded-full bg-green-500" /> Camera Active
+                </div>
+                <div className="flex items-center gap-1.5 text-green-600">
+                  <div className="h-1.5 w-1.5 rounded-full bg-green-500" /> Mic Active
+                </div>
+                <div
+                  className={`flex items-center gap-1.5 ${
+                    isFullscreen ? "text-green-600" : "text-yellow-600"
+                  }`}
+                >
+                  <div
+                    className={`h-1.5 w-1.5 rounded-full ${
+                      isFullscreen ? "bg-green-500" : "bg-yellow-500"
+                    }`}
+                  />
                   {isFullscreen ? "Fullscreen" : "Not Fullscreen"}
                 </div>
-                <div className={`flex items-center gap-1.5 ${apiConnected ? "text-green-600" : "text-gray-400"}`}>
-                  <div className={`h-1.5 w-1.5 rounded-full ${apiConnected ? "bg-green-500" : "bg-gray-400"}`} />
+                <div
+                  className={`flex items-center gap-1.5 ${
+                    apiConnected ? "text-green-600" : "text-gray-400"
+                  }`}
+                >
+                  <div
+                    className={`h-1.5 w-1.5 rounded-full ${
+                      apiConnected ? "bg-green-500" : "bg-gray-400"
+                    }`}
+                  />
                   {apiConnected ? "AI Proctored" : "AI Offline"}
                 </div>
               </div>
@@ -696,9 +968,18 @@ export default function IntervieweeSession() {
                 <CardTitle className="text-lg">{currentQuestion.question_text}</CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
-                <VoiceAnswer questionId={currentQuestion.id} value={answers[currentQuestion.id] || ""} onChange={handleAnswerChange} />
+                <VoiceAnswer
+                  questionId={currentQuestion.id}
+                  value={answers[currentQuestion.id] || ""}
+                  onChange={handleAnswerChange}
+                />
                 <div className="flex items-center justify-between">
-                  <Button variant="outline" onClick={() => setCurrentIndex((i) => Math.max(0, i - 1))} disabled={currentIndex === 0} className="gap-2">
+                  <Button
+                    variant="outline"
+                    onClick={() => setCurrentIndex((i) => Math.max(0, i - 1))}
+                    disabled={currentIndex === 0}
+                    className="gap-2"
+                  >
                     <ArrowLeft className="h-4 w-4" /> Previous
                   </Button>
                   {currentIndex < questions.length - 1 ? (
