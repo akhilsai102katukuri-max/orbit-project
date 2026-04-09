@@ -76,99 +76,63 @@ function PermissionScreen({ onGranted }: { onGranted: (stream: MediaStream) => v
   );
 }
 
-// TF-IDF inspired keyword scoring — much fairer than pure word match
-function scoreAnswer(expected: string, given: string): number {
-  if (!given || !given.trim()) return 0;
-  if (!expected || !expected.trim()) return given.trim().length > 0 ? 60 : 0;
+// ─── AI Answer Evaluation via HuggingFace API ─────────────────────────────────
+const PROCTORING_API = "https://akhilsai-328-orbit-proctoring-api.hf.space";
 
-  const stopwords = new Set([
-    "a","an","the","is","are","was","were","be","been","being","have","has","had",
-    "do","does","did","will","would","could","should","may","might","shall","can",
-    "to","of","in","for","on","with","at","by","from","and","or","but","if","as",
-    "it","its","this","that","these","those","i","you","he","she","we","they",
-    "what","which","who","how","when","where","why","not","no","yes","so","very",
-    "just","also","than","then","there","here","more","some","any","all","each",
-    "about","into","through","during","before","after","above","below","between",
-  ]);
+async function evaluateAnswerWithAI(
+  candidateAnswer: string,
+  expectedAnswer: string
+): Promise<{ score: number; feedback: string }> {
+  // Fallback scoring in case API is unavailable
+  const fallbackScore = (expected: string, given: string): number => {
+    if (!given || !given.trim()) return 0;
+    if (!expected || !expected.trim()) return given.trim().length > 0 ? 60 : 0;
+    const stopwords = new Set([
+      "a","an","the","is","are","was","were","be","been","being","have","has","had",
+      "do","does","did","will","would","could","should","may","might","shall","can",
+      "to","of","in","for","on","with","at","by","from","and","or","but","if","as",
+      "it","its","this","that","these","those","i","you","he","she","we","they",
+    ]);
+    const normalize = (text: string) =>
+      text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((w) => w.length > 1 && !stopwords.has(w));
+    const expectedKw = normalize(expected);
+    const givenKw = normalize(given);
+    if (expectedKw.length === 0) return givenKw.length > 3 ? 70 : 40;
+    const givenSet = new Set(givenKw);
+    let matches = 0;
+    for (const kw of expectedKw) if (givenSet.has(kw)) matches++;
+    const lengthBonus = Math.min(15, givenKw.length * 0.8);
+    return Math.min(100, Math.round((matches / expectedKw.length) * 85 + lengthBonus));
+  };
 
-  const normalize = (text: string) =>
-    text
-      .toLowerCase()
-      .replace(/[^a-z0-9\s]/g, " ")
-      .split(/\s+/)
-      .filter((w) => w.length > 1 && !stopwords.has(w));
+  try {
+    const resp = await fetch(`${PROCTORING_API}/evaluate-answer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        candidate_answer: candidateAnswer,
+        expected_answer: expectedAnswer,
+      }),
+    });
 
-  const expectedKeywords = normalize(expected);
-  const givenWords = normalize(given);
+    if (!resp.ok) throw new Error("API error");
 
-  if (expectedKeywords.length === 0) return givenWords.length > 3 ? 70 : 40;
-
-  const givenSet = new Set(givenWords);
-
-  // Exact matches
-  let exactMatches = 0;
-  for (const kw of expectedKeywords) {
-    if (givenSet.has(kw)) exactMatches++;
-  }
-
-  // Stem/partial matches — 70% prefix overlap counts as match
-  let partialMatches = 0;
-  for (const kw of expectedKeywords) {
-    if (givenSet.has(kw)) continue;
-    for (const gw of givenWords) {
-      const minLen = Math.min(kw.length, gw.length);
-      if (minLen < 3) continue;
-      const prefixLen = Math.ceil(minLen * 0.7);
-      if (kw.slice(0, prefixLen) === gw.slice(0, prefixLen)) {
-        partialMatches++;
-        break;
-      }
-    }
-  }
-
-  // Synonym/concept pairs — boost score when candidate uses equivalent terms
-  const synonymPairs: [string, string][] = [
-    ["object","oop"],["oriented","class"],["inheritance","extend"],
-    ["polymorphism","override"],["encapsulation","private"],
-    ["abstraction","abstract"],["function","method"],["array","list"],
-    ["loop","iterate"],["variable","store"],["memory","ram"],
-    ["database","db"],["sql","query"],["server","backend"],
-    ["client","frontend"],["network","internet"],["protocol","http"],
-    ["class","object"],["compile","build"],["runtime","execute"],
-  ];
-  let synonymBonus = 0;
-  for (const [a, b] of synonymPairs) {
-    const expHas = expectedKeywords.includes(a) || expectedKeywords.includes(b);
-    const givHas = givenSet.has(a) || givenSet.has(b);
-    if (expHas && givHas) synonymBonus += 0.5;
-  }
-
-  // Length/detail bonus — longer detailed answer gets up to 15 bonus points
-  const lengthBonus = Math.min(15, givenWords.length * 0.8);
-
-  // Base: exact + partial weighted, scaled to 85
-  const matchRatio = (exactMatches + partialMatches * 0.7 + synonymBonus) / expectedKeywords.length;
-  const baseScore = matchRatio * 85;
-
-  return Math.min(100, Math.round(baseScore + lengthBonus));
-}
-
-function getScores(
-  questions: Question[],
-  answers: Record<string, string>
-): { score: number; feedback: string }[] {
-  return questions.map((q) => {
-    const given = (answers[q.id] || "").trim();
-    const score = scoreAnswer(q.expected_answer, given);
-    let feedback = "Score based on keyword relevance to expected response.";
-    if (!given) feedback = "No answer provided.";
+    const data = await resp.json();
+    return {
+      score: data.score ?? 0,
+      feedback: data.feedback ?? "Evaluated by AI.",
+    };
+  } catch {
+    // API offline — use fallback
+    const score = fallbackScore(expectedAnswer, candidateAnswer);
+    let feedback = "Score based on keyword relevance.";
+    if (!candidateAnswer.trim()) feedback = "No answer provided.";
     else if (score >= 85) feedback = "Excellent — covered all key concepts.";
     else if (score >= 65) feedback = "Good answer, covered most key points.";
     else if (score >= 40) feedback = "Partial answer — some key concepts missing.";
-    else if (score > 0) feedback = "Answer lacks key concepts from expected response.";
-    else feedback = "Answer does not match expected response.";
+    else feedback = "Answer lacks key concepts from expected response.";
     return { score, feedback };
-  });
+  }
 }
 
 async function analyzeFrame(
@@ -191,7 +155,7 @@ async function analyzeFrame(
     ctx.drawImage(video, 0, 0);
     const frameData = canvas.toDataURL("image/jpeg", 0.5);
 
-    const resp = await fetch("https://akhilsai-328-orbit-proctoring-api.hf.space/analyze", {
+    const resp = await fetch(`${PROCTORING_API}/analyze`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ frame: frameData }),
@@ -220,9 +184,6 @@ async function analyzeFrame(
 }
 
 // ─── VoiceAnswer ──────────────────────────────────────────────────────────────
-// FIX: uses a ref-based accumulator to prevent duplicate/stale transcript issues.
-// Speech recognition interim results are shown live but NOT appended to the
-// stored answer — only final results are appended, each segment exactly once.
 function VoiceAnswer({
   questionId,
   value,
@@ -237,12 +198,9 @@ function VoiceAnswer({
   const [interimText, setInterimText] = useState("");
   const recognitionRef = useRef<any>(null);
   const isRecordingRef = useRef(false);
-  // Accumulates only final segments — never re-reads `value` from closure
   const finalAccRef = useRef<string>("");
 
-  // Keep accumulator in sync when question changes (user navigates away)
   useEffect(() => {
-    // Stop any ongoing recording when question changes
     if (isRecordingRef.current) {
       isRecordingRef.current = false;
       recognitionRef.current?.stop();
@@ -271,7 +229,6 @@ function VoiceAnswer({
       return;
     }
 
-    // Sync accumulator with current saved value before starting
     finalAccRef.current = value ?? "";
 
     const recognition = new SR();
@@ -284,7 +241,6 @@ function VoiceAnswer({
       let interim = "";
       for (let i = event.resultIndex; i < event.results.length; i++) {
         if (event.results[i].isFinal) {
-          // Pick highest-confidence alternative
           let best = event.results[i][0].transcript;
           let bestConf = event.results[i][0].confidence ?? 0;
           for (let j = 1; j < event.results[i].length; j++) {
@@ -296,7 +252,6 @@ function VoiceAnswer({
           }
           const segment = best.trim();
           if (segment) {
-            // Append to accumulator — no stale closure, no duplication
             finalAccRef.current = finalAccRef.current
               ? finalAccRef.current + " " + segment
               : segment;
@@ -313,9 +268,7 @@ function VoiceAnswer({
     recognition.onerror = (e: any) => {
       if (e.error === "no-speech") {
         if (isRecordingRef.current) {
-          try {
-            recognitionRef.current?.start();
-          } catch {}
+          try { recognitionRef.current?.start(); } catch {}
         }
       } else if (e.error !== "aborted") {
         toast.error(`Speech error: ${e.error}`);
@@ -328,9 +281,7 @@ function VoiceAnswer({
     recognition.onend = () => {
       setInterimText("");
       if (isRecordingRef.current) {
-        try {
-          recognitionRef.current.start();
-        } catch {}
+        try { recognitionRef.current.start(); } catch {}
       } else {
         setIsRecording(false);
       }
@@ -364,7 +315,6 @@ function VoiceAnswer({
       </div>
     );
 
-  // What we display: saved final text + live interim (interim shown in a lighter style)
   const displayText = value || "";
 
   return (
@@ -377,13 +327,9 @@ function VoiceAnswer({
           className={`gap-2 ${isRecording ? "animate-pulse" : ""}`}
         >
           {isRecording ? (
-            <>
-              <MicOff className="h-4 w-4" /> Stop Recording
-            </>
+            <><MicOff className="h-4 w-4" /> Stop Recording</>
           ) : (
-            <>
-              <Mic className="h-4 w-4" /> Start Recording
-            </>
+            <><Mic className="h-4 w-4" /> Start Recording</>
           )}
         </Button>
         {isRecording && (
@@ -448,20 +394,15 @@ export default function IntervieweeSession() {
   const [apiConnected, setApiConnected] = useState(false);
   const [timeLeft, setTimeLeft] = useState<number>(30 * 60);
 
-  // Use a ref for warningCount so callbacks always see fresh value
   const warningCountRef = useRef(0);
-  const terminatedRef = useRef(false); // prevent double-terminate
+  const terminatedRef = useRef(false);
   const navigateRef = useRef(navigate);
-  // Keep navigateRef always pointing to latest navigate function
   useEffect(() => { navigateRef.current = navigate; }, [navigate]);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
-
-  // Gaze counter: every 3 gaze_away detections = 1 warning
   const gazeCountRef = useRef(0);
 
-  // ── Fullscreen helper ──
   const [showFullscreenOverlay, setShowFullscreenOverlay] = useState(false);
 
   const enterFullscreen = useCallback(async () => {
@@ -474,25 +415,16 @@ export default function IntervieweeSession() {
     }
   }, []);
 
-  // ── Terminate session — navigate INSTANTLY, do DB/recording in background ──
   const terminateSession = useCallback(
     (reason: string) => {
       if (terminatedRef.current) return;
       terminatedRef.current = true;
 
-      // Show error toast immediately
       toast.error(reason, { duration: 8000 });
-
-      // Stop camera immediately
       cameraStreamRef.current?.getTracks().forEach((t) => t.stop());
-
-      // Exit fullscreen immediately
       if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-
-      // Navigate IMMEDIATELY — no awaiting
       navigateRef.current("/interviewee");
 
-      // Do DB update and recording upload in background (non-blocking)
       (async () => {
         try {
           if (interviewId && user?.id) {
@@ -519,7 +451,6 @@ export default function IntervieweeSession() {
     [interviewId, user]
   );
 
-  // ── Add a warning; terminate immediately if count reaches 3 ──
   const addWarning = useCallback(
     (message: string) => {
       if (terminatedRef.current) return;
@@ -528,7 +459,6 @@ export default function IntervieweeSession() {
       setWarningCount(next);
 
       if (next >= 3) {
-        // Terminate immediately — don't wait for state re-render
         terminateSession("Interview terminated due to repeated violations.");
       } else {
         toast.warning(`⚠️ ${message} Warning ${next}/3`, { duration: 5000 });
@@ -537,12 +467,10 @@ export default function IntervieweeSession() {
     [terminateSession]
   );
 
-  // ── High severity AI violation ──
   const handleHighSeverityViolation = useCallback(() => {
     addWarning("Proctoring violation detected!");
   }, [addWarning]);
 
-  // ── Gaze away — 3 detections = 1 warning ──
   const handleGazeAway = useCallback(() => {
     gazeCountRef.current += 1;
     if (gazeCountRef.current >= 3) {
@@ -560,7 +488,7 @@ export default function IntervieweeSession() {
 
   // ── Health check ──
   useEffect(() => {
-    fetch("https://akhilsai-328-orbit-proctoring-api.hf.space/health")
+    fetch(`${PROCTORING_API}/health`)
       .then((r) => r.json())
       .then((d) => { if (d.status === "running") setApiConnected(true); })
       .catch(() => setApiConnected(false));
@@ -606,7 +534,6 @@ export default function IntervieweeSession() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [permissionsGranted]);
 
-  // ── Permissions granted handler ──
   const handlePermissionsGranted = useCallback(
     async (stream: MediaStream) => {
       setCameraStream(stream);
@@ -650,7 +577,6 @@ export default function IntervieweeSession() {
     [enterFullscreen, user, interviewId]
   );
 
-  // ── Block copy/paste/F11; Escape key → re-enter fullscreen ──
   useEffect(() => {
     if (!permissionsGranted) return;
     const block = (e: KeyboardEvent) => {
@@ -659,30 +585,20 @@ export default function IntervieweeSession() {
         toast.warning("Copy/paste is disabled.", { id: "copy-paste" });
       }
       if (e.key === "F11") e.preventDefault();
-      // Escape: browser will exit fullscreen before this fires, so we handle
-      // it in fullscreenchange below. Just prevent default here.
-      if (e.key === "Escape") {
-        e.preventDefault();
-      }
+      if (e.key === "Escape") e.preventDefault();
     };
     window.addEventListener("keydown", block, true);
     return () => window.removeEventListener("keydown", block, true);
   }, [permissionsGranted]);
 
-  // ── Fullscreen exit → add warning + auto-return ──
   useEffect(() => {
     if (!permissionsGranted) return;
 
     const handleFsChange = () => {
       if (!document.fullscreenElement) {
         setIsFullscreen(false);
-        // Add the warning (will terminate at 3)
         addWarning("Fullscreen exit detected!");
-        // Show fullscreen overlay immediately — user must click to re-enter
-        // (browsers require a direct user gesture to call requestFullscreen)
-        if (!terminatedRef.current) {
-          setShowFullscreenOverlay(true);
-        }
+        if (!terminatedRef.current) setShowFullscreenOverlay(true);
       } else {
         setIsFullscreen(true);
         setShowFullscreenOverlay(false);
@@ -693,7 +609,6 @@ export default function IntervieweeSession() {
     return () => document.removeEventListener("fullscreenchange", handleFsChange);
   }, [permissionsGranted, enterFullscreen, addWarning]);
 
-  // ── Tab switch detection ──
   useEffect(() => {
     if (!permissionsGranted) return;
     const handleVisibility = () => {
@@ -714,7 +629,6 @@ export default function IntervieweeSession() {
     return () => document.removeEventListener("visibilitychange", handleVisibility);
   }, [permissionsGranted, user, interviewId, addWarning]);
 
-  // ── Block right-click ──
   useEffect(() => {
     if (!permissionsGranted) return;
     const block = (e: MouseEvent) => e.preventDefault();
@@ -722,12 +636,10 @@ export default function IntervieweeSession() {
     return () => document.removeEventListener("contextmenu", block);
   }, [permissionsGranted]);
 
-  // ── Attach camera stream to video element ──
   useEffect(() => {
     if (videoRef.current && cameraStream) videoRef.current.srcObject = cameraStream;
   }, [cameraStream, permissionsGranted]);
 
-  // ── Cleanup on unmount ──
   useEffect(() => {
     return () => {
       cameraStream?.getTracks().forEach((t) => t.stop());
@@ -735,7 +647,6 @@ export default function IntervieweeSession() {
     };
   }, [cameraStream]);
 
-  // ── Load questions + check if already terminated/completed ──
   useEffect(() => {
     const fetchQuestions = async () => {
       if (user) {
@@ -785,6 +696,7 @@ export default function IntervieweeSession() {
     setAnswers((prev) => ({ ...prev, [questionId]: text }));
   };
 
+  // ── Submit — now calls AI scoring API ──
   const handleSubmit = async () => {
     if (!user) return;
     setSubmitting(true);
@@ -796,8 +708,19 @@ export default function IntervieweeSession() {
         .maybeSingle();
       const userName = profileData?.full_name || user.email || "Unknown";
 
-      toast.info("Evaluating your answers...", { id: "ai-scoring" });
-      const results = getScores(questions, answers);
+      toast.info("🤖 AI is evaluating your answers...", { id: "ai-scoring" });
+
+      // Call AI scoring for all questions in parallel
+      const results = await Promise.all(
+        questions.map((q) =>
+          evaluateAnswerWithAI(
+            (answers[q.id] || "").trim(),
+            q.expected_answer
+          )
+        )
+      );
+
+      toast.success("✅ Evaluation complete!", { id: "ai-scoring" });
 
       const { error: respError } = await (supabase as any)
         .from("interviewee_responses")
@@ -861,11 +784,8 @@ export default function IntervieweeSession() {
 
   if (!permissionsGranted) return <PermissionScreen onGranted={handlePermissionsGranted} />;
 
-
-
   return (
     <div ref={sessionRef} className="space-y-4 animate-fade-in select-none">
-      {/* Fullscreen overlay — fixed position so camera/video keeps running underneath */}
       {showFullscreenOverlay && !terminatedRef.current && (
         <div
           style={{
@@ -899,6 +819,7 @@ export default function IntervieweeSession() {
           </button>
         </div>
       )}
+
       {warningCount > 0 && (
         <div className="bg-destructive/10 border border-destructive/30 rounded-lg p-3 flex items-center gap-2">
           <ShieldAlert className="h-4 w-4 text-destructive flex-shrink-0" />
@@ -1013,28 +934,12 @@ export default function IntervieweeSession() {
                 <div className="flex items-center gap-1.5 text-green-600">
                   <div className="h-1.5 w-1.5 rounded-full bg-green-500" /> Mic Active
                 </div>
-                <div
-                  className={`flex items-center gap-1.5 ${
-                    isFullscreen ? "text-green-600" : "text-yellow-600"
-                  }`}
-                >
-                  <div
-                    className={`h-1.5 w-1.5 rounded-full ${
-                      isFullscreen ? "bg-green-500" : "bg-yellow-500"
-                    }`}
-                  />
+                <div className={`flex items-center gap-1.5 ${isFullscreen ? "text-green-600" : "text-yellow-600"}`}>
+                  <div className={`h-1.5 w-1.5 rounded-full ${isFullscreen ? "bg-green-500" : "bg-yellow-500"}`} />
                   {isFullscreen ? "Fullscreen" : "Not Fullscreen"}
                 </div>
-                <div
-                  className={`flex items-center gap-1.5 ${
-                    apiConnected ? "text-green-600" : "text-gray-400"
-                  }`}
-                >
-                  <div
-                    className={`h-1.5 w-1.5 rounded-full ${
-                      apiConnected ? "bg-green-500" : "bg-gray-400"
-                    }`}
-                  />
+                <div className={`flex items-center gap-1.5 ${apiConnected ? "text-green-600" : "text-gray-400"}`}>
+                  <div className={`h-1.5 w-1.5 rounded-full ${apiConnected ? "bg-green-500" : "bg-gray-400"}`} />
                   {apiConnected ? "AI Proctored" : "AI Offline"}
                 </div>
               </div>

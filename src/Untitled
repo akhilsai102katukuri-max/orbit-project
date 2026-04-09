@@ -1,0 +1,1 @@
+Get-ChildItem -Path src -Recurse -Include "*.ts","*.tsx" | Select-String "5000|proctoring-api|analyze" | Select-Object Filename, Line -Unique

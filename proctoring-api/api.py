@@ -8,6 +8,9 @@ import threading
 import mediapipe as mp
 from ultralytics import YOLO
 
+# Fix for tokenizer warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 app = Flask(__name__)
 CORS(app)
 
@@ -40,15 +43,26 @@ def load_answer_evaluator():
     answer_evaluator = SentenceTransformer('all-MiniLM-L6-v2')
     print("Sentence Transformer loaded successfully!")
 
+
+# ✅ LOAD MODELS AT STARTUP (IMPORTANT FOR HUGGINGFACE)
+try:
+    load_answer_evaluator()
+except Exception as e:
+    print("❌ Failed to load Sentence Transformer:", e)
+
+try:
+    load_yolo()
+except Exception as e:
+    print("❌ Failed to load YOLO:", e)
+
+
 # --- Head Pose / Gaze ---
 YAW_THRESHOLD = 20
 PITCH_THRESHOLD = 15
 PHONE_DETECTION_CONFIDENCE = 0.5
 
 def get_gaze_direction_mediapipe(face_landmarks, frame_w, frame_h):
-    """Estimate gaze direction using MediaPipe face landmarks."""
     try:
-        # Use nose tip (1) and face edges (234 left, 454 right) for yaw
         nose = face_landmarks.landmark[1]
         left_edge = face_landmarks.landmark[234]
         right_edge = face_landmarks.landmark[454]
@@ -61,7 +75,6 @@ def get_gaze_direction_mediapipe(face_landmarks, frame_w, frame_h):
         if face_width == 0:
             return "Forward", False
 
-        # Normalize nose position within face
         nose_ratio = (nose_x - left_x) / face_width
 
         gaze_direction = "Forward"
@@ -187,25 +200,6 @@ def analyze_frame():
 # --- Answer Evaluation Endpoint ---
 @app.route('/evaluate-answer', methods=['POST'])
 def evaluate_answer():
-    """
-    Score a candidate's spoken answer against the expected answer.
-    Uses Sentence Transformers (all-MiniLM-L6-v2) for semantic similarity.
-
-    Request JSON:
-    {
-        "candidate_answer": "polymorphism lets one function work with many types",
-        "expected_answer": "polymorphism allows one interface to be used for different data types",
-        "question": "What is polymorphism?" (optional, for context)
-    }
-
-    Response JSON:
-    {
-        "score": 85,           // 0-100
-        "similarity": 0.85,    // raw cosine similarity
-        "feedback": "Good answer! ...",
-        "grade": "Good"        // Excellent / Good / Fair / Poor
-    }
-    """
     try:
         if answer_evaluator is None:
             return jsonify({"error": "Answer evaluator not loaded yet. Please wait and retry."}), 503
@@ -213,23 +207,19 @@ def evaluate_answer():
         data = request.json
         candidate_answer = data.get('candidate_answer', '').strip()
         expected_answer = data.get('expected_answer', '').strip()
-        question = data.get('question', '').strip()
 
         if not candidate_answer:
             return jsonify({"error": "candidate_answer is required"}), 400
         if not expected_answer:
             return jsonify({"error": "expected_answer is required"}), 400
 
-        # Encode both answers into embeddings
         from sklearn.metrics.pairwise import cosine_similarity
 
         embeddings = answer_evaluator.encode([candidate_answer, expected_answer])
         similarity = float(cosine_similarity([embeddings[0]], [embeddings[1]])[0][0])
 
-        # Convert similarity (0 to 1) to score (0 to 100)
         score = round(similarity * 100)
 
-        # Grade thresholds
         if score >= 80:
             grade = "Excellent"
             feedback = "Great answer! Your response closely matches the expected answer."
@@ -241,7 +231,7 @@ def evaluate_answer():
             feedback = "Partial answer. You touched on some key points but missed important aspects."
         else:
             grade = "Poor"
-            feedback = "Your answer didn't align well with the expected response. Review this topic."
+            feedback = "Your answer didn't align well with the expected response."
 
         return jsonify({
             "score": score,
@@ -267,9 +257,3 @@ def health():
         "answer_evaluator_loaded": answer_evaluator is not None,
         "answer_evaluator_model": "all-MiniLM-L6-v2"
     })
-
-
-if __name__ == '__main__':
-    load_yolo()
-    load_answer_evaluator()
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
