@@ -1,7 +1,8 @@
-Flask
+flask
 flask-cors
 opencv-python-headless
 numpy
+mediapipe
 ultralytics
-gunicorn
-dlib
+sentence-transformers
+scikit-learn

@@ -1,144 +1,85 @@
-import sys
-print("Starting ORBIT Proctoring API...", flush=True)
-
-from flask import Flask, request, jsonify
-from flask_cors import CORS
 import cv2
 import numpy as np
 import os
-import base64
-
-print("Imports done", flush=True)
+import time
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import threading
+import mediapipe as mp
+from ultralytics import YOLO
 
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:8080", "http://localhost:8081"])
+CORS(app)
 
-# --- Global model variables ---
-detector = None
-predictor = None
-yolo_model = None  # ← was: yolo_net, yolo_classes, yolo_output_layers
+# --- MediaPipe Face Detection ---
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(
+    static_image_mode=False,
+    max_num_faces=5,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
 
-def load_models():
-    global detector, predictor, yolo_model
+# --- YOLOv11 nano Object Detection ---
+yolo_model = None
 
-    current_dir = os.path.dirname(os.path.abspath(__file__))
+def load_yolo():
+    global yolo_model
+    print("Loading YOLOv11 nano model...")
+    yolo_model = YOLO("yolo11n.pt")
+    print("YOLOv11 nano loaded successfully!")
 
-    # Load dlib (unchanged)
-    try:
-        import dlib
-        print("Loading dlib face detector...", flush=True)
-        detector = dlib.get_frontal_face_detector()
+# --- Sentence Transformer for Answer Evaluation ---
+answer_evaluator = None
 
-        predictor_path = os.path.join(current_dir, "shape_predictor_68_face_landmarks.dat")
-        if os.path.exists(predictor_path):
-            predictor = dlib.shape_predictor(predictor_path)
-            print("Dlib loaded successfully!", flush=True)
-        else:
-            print(f"WARNING: shape_predictor not found at {predictor_path}", flush=True)
-    except Exception as e:
-        print(f"Dlib load error: {e}", flush=True)
+def load_answer_evaluator():
+    global answer_evaluator
+    print("Loading Sentence Transformer model...")
+    from sentence_transformers import SentenceTransformer
+    answer_evaluator = SentenceTransformer('all-MiniLM-L6-v2')
+    print("Sentence Transformer loaded successfully!")
 
-    # ── UPGRADED: YOLOv4 → YOLOv11 nano ──────────────────────────────────────
-    # Old code needed: yolov4.weights + yolov4.cfg + coco.names.txt (~250 MB)
-    # New code needs:  nothing — yolo11n.pt auto-downloads (~6 MB) on first run
-    try:
-        from ultralytics import YOLO
-        print("Loading YOLOv11 nano model...", flush=True)
-        yolo_model = YOLO("yolo11n.pt")   # downloads automatically if not cached
-        # Warm-up pass so first /analyze call isn't slow
-        dummy = np.zeros((240, 320, 3), dtype=np.uint8)
-        yolo_model(dummy, verbose=False)
-        print("YOLOv11 nano loaded successfully!", flush=True)
-    except Exception as e:
-        print(f"YOLOv11 load error: {e}", flush=True)
-    # ─────────────────────────────────────────────────────────────────────────
-
-
-# Head pose constants (unchanged)
-MODEL_POINTS = np.array([
-    (0.0, 0.0, 0.0), (0.0, -330.0, -65.0),
-    (-225.0, 170.0, -135.0), (225.0, 170.0, -135.0),
-    (-150.0, -150.0, -125.0), (150.0, -150.0, -125.0)
-], dtype="double")
-
+# --- Head Pose / Gaze ---
 YAW_THRESHOLD = 20
+PITCH_THRESHOLD = 15
+PHONE_DETECTION_CONFIDENCE = 0.5
 
-def get_head_pose(landmarks, frame_size):
-    # Unchanged
-    image_points = np.array([
-        (landmarks.part(30).x, landmarks.part(30).y),
-        (landmarks.part(8).x, landmarks.part(8).y),
-        (landmarks.part(36).x, landmarks.part(36).y),
-        (landmarks.part(45).x, landmarks.part(45).y),
-        (landmarks.part(48).x, landmarks.part(48).y),
-        (landmarks.part(54).x, landmarks.part(54).y)
-    ], dtype="double")
+def get_gaze_direction_mediapipe(face_landmarks, frame_w, frame_h):
+    """Estimate gaze direction using MediaPipe face landmarks."""
+    try:
+        # Use nose tip (1) and face edges (234 left, 454 right) for yaw
+        nose = face_landmarks.landmark[1]
+        left_edge = face_landmarks.landmark[234]
+        right_edge = face_landmarks.landmark[454]
 
-    focal_length = frame_size[1]
-    center = (frame_size[1] / 2, frame_size[0] / 2)
-    camera_matrix = np.array([
-        [focal_length, 0, center[0]],
-        [0, focal_length, center[1]],
-        [0, 0, 1]
-    ], dtype="double")
-    dist_coeffs = np.zeros((4, 1))
+        nose_x = nose.x
+        left_x = left_edge.x
+        right_x = right_edge.x
 
-    _, rotation_vector, translation_vector = cv2.solvePnP(
-        MODEL_POINTS, image_points, camera_matrix, dist_coeffs,
-        flags=cv2.SOLVEPNP_ITERATIVE
-    )
-    rmat, _ = cv2.Rodrigues(rotation_vector)
-    proj_matrix = np.hstack((rmat, translation_vector))
-    euler_angles = cv2.decomposeProjectionMatrix(proj_matrix, camera_matrix, dist_coeffs)[6]
-    return float(euler_angles[0]), float(euler_angles[1])
+        face_width = right_x - left_x
+        if face_width == 0:
+            return "Forward", False
 
+        # Normalize nose position within face
+        nose_ratio = (nose_x - left_x) / face_width
 
-@app.route('/', methods=['GET'])
-def index():
-    # Unchanged
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>ORBIT Proctoring API</title>
-        <style>
-            body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
-            h1 { color: #333; }
-            .status { padding: 10px; background: #e8f5e9; border-radius: 5px; margin: 20px 0; }
-            .endpoint { background: #f5f5f5; padding: 15px; margin: 10px 0; border-radius: 5px; }
-            code { background: #333; color: #fff; padding: 2px 6px; border-radius: 3px; }
-        </style>
-    </head>
-    <body>
-        <h1>🎯 ORBIT Proctoring API</h1>
-        <div class="status">
-            <strong>Status:</strong> ✅ API is running
-        </div>
-        <h2>Available Endpoints:</h2>
-        <div class="endpoint">
-            <strong>GET /health</strong><br>
-            Check API health status
-        </div>
-        <div class="endpoint">
-            <strong>POST /analyze</strong><br>
-            Analyze video frame for cheating detection<br>
-            <small>Expects JSON with base64 encoded frame</small>
-        </div>
-        <p>For more information, visit <code>/health</code> to check system status.</p>
-    </body>
-    </html>
-    """
+        gaze_direction = "Forward"
+        is_gaze_threat = False
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({
-        "status": "running",
-        "dlib_loaded": detector is not None,
-        "yolo_loaded": yolo_model is not None,   # ← updated key name
-        "yolo_version": "YOLOv11 nano"            # ← new info field
-    })
+        if nose_ratio < 0.40:
+            gaze_direction = "Right"
+            is_gaze_threat = True
+        elif nose_ratio > 0.60:
+            gaze_direction = "Left"
+            is_gaze_threat = True
+
+        return gaze_direction, is_gaze_threat
+    except Exception:
+        return "Unknown", False
 
 
+# --- Main Analysis Endpoint ---
 @app.route('/analyze', methods=['POST'])
 def analyze_frame():
     try:
@@ -146,118 +87,189 @@ def analyze_frame():
         image_data = data.get('frame', '')
 
         if not image_data:
-            return jsonify({"violations": [], "face_count": 0})
+            return jsonify({"error": "No frame provided", "violations": []}), 400
 
-        # Decode base64 image (unchanged)
+        import base64
         img_bytes = base64.b64decode(image_data.split(',')[1])
         np_arr = np.frombuffer(img_bytes, np.uint8)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
         if frame is None:
-            return jsonify({"violations": [], "face_count": 0})
+            return jsonify({"error": "Could not decode image", "violations": []}), 400
 
         frame = cv2.resize(frame, (320, 240))
         height, width, _ = frame.shape
+
         violations = []
         face_count = 0
+        gaze_direction = "Unknown"
+        phone_detected = False
 
-        # --- Face Detection + Head Pose (unchanged) ---
-        if detector is not None:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = detector(gray)
-            face_count = len(faces)
+        # --- MediaPipe Face Detection ---
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = face_mesh.process(rgb_frame)
 
-            if face_count == 0:
-                violations.append({
-                    "type": "no_face",
-                    "severity": "high",
-                    "message": "No face detected in frame"
-                })
-            elif face_count > 1:
+        if results.multi_face_landmarks:
+            face_count = len(results.multi_face_landmarks)
+
+            if face_count > 1:
                 violations.append({
                     "type": "multiple_faces",
                     "severity": "high",
-                    "message": f"{face_count} faces detected"
+                    "message": f"{face_count} faces detected in frame"
                 })
-            elif face_count == 1 and predictor is not None:
-                try:
-                    face = faces[0]
-                    landmarks = predictor(gray, face)
-                    pitch, yaw = get_head_pose(landmarks, (height, width))
-                    if yaw > YAW_THRESHOLD:
-                        violations.append({
-                            "type": "gaze_away",
-                            "severity": "medium",
-                            "message": "Candidate looking Left"
-                        })
-                    elif yaw < -YAW_THRESHOLD:
-                        violations.append({
-                            "type": "gaze_away",
-                            "severity": "medium",
-                            "message": "Candidate looking Right"
-                        })
-                except Exception:
-                    pass
+            else:
+                face_landmarks = results.multi_face_landmarks[0]
+                gaze_direction, is_gaze_threat = get_gaze_direction_mediapipe(
+                    face_landmarks, width, height
+                )
+                if is_gaze_threat:
+                    violations.append({
+                        "type": "gaze_away",
+                        "severity": "medium",
+                        "message": f"Candidate looking {gaze_direction}"
+                    })
+        else:
+            face_count = 0
+            violations.append({
+                "type": "no_face",
+                "severity": "high",
+                "message": "No face detected in frame"
+            })
 
-        # ── UPGRADED: YOLOv4 cv2.dnn → YOLOv11 nano (ultralytics) ───────────
-        # What changed:
-        #   - Removed: blob creation, net.setInput, net.forward, manual NMS
-        #   - Added:   single model() call — NMS is built-in
-        #   - Output:  same violation dicts as before, zero logic change
+        # --- YOLOv11 Object Detection ---
         if yolo_model is not None:
-            try:
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = yolo_model(rgb_frame, conf=0.5, iou=0.4, verbose=False)[0]
+            yolo_results = yolo_model(frame, verbose=False, conf=0.5)
+            num_persons = 0
 
-                num_persons = 0
-                for box in results.boxes:
-                    cls_id = int(box.cls[0])
-                    label  = yolo_model.names[cls_id]   # e.g. "cell phone", "person"
-                    conf   = float(box.conf[0])
+            for result in yolo_results:
+                for box in result.boxes:
+                    class_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    label = yolo_model.names[class_id]
 
-                    if label == "cell phone" and conf > 0.6:
+                    if label == "cell phone" and conf > PHONE_DETECTION_CONFIDENCE:
+                        phone_detected = True
                         violations.append({
                             "type": "phone_detected",
                             "severity": "high",
-                            "message": f"Mobile phone detected ({conf:.0%})"
+                            "message": f"Mobile phone detected (confidence: {conf:.0%})"
                         })
                     elif label == "person":
                         num_persons += 1
-                    elif label in ["book", "laptop"]:
+                    elif label in ["book", "laptop", "mouse", "keyboard", "remote"]:
                         violations.append({
                             "type": "prohibited_object",
                             "severity": "medium",
-                            "message": f"Prohibited object: {label}"
+                            "message": f"Prohibited object detected: {label}"
                         })
 
-                if num_persons > 1:
-                    violations.append({
-                        "type": "multiple_persons",
-                        "severity": "high",
-                        "message": f"{num_persons} persons detected"
-                    })
-
-            except Exception as e:
-                print(f"YOLOv11 detection error: {e}", flush=True)
-        # ─────────────────────────────────────────────────────────────────────
+            if num_persons > 1:
+                violations.append({
+                    "type": "multiple_persons",
+                    "severity": "high",
+                    "message": f"{num_persons} persons detected by object detection"
+                })
 
         return jsonify({
             "face_count": face_count,
+            "gaze_direction": gaze_direction,
+            "phone_detected": phone_detected,
             "violations": violations,
             "status": "ok"
         })
 
     except Exception as e:
-        print(f"Analyze error: {e}", flush=True)
-        return jsonify({"violations": [], "face_count": 0, "error": str(e)}), 500
+        print(f"Analysis error: {e}")
+        return jsonify({"error": str(e), "violations": []}), 500
 
 
-# Load models at startup — runs with both gunicorn and python directly
-print("Loading models...", flush=True)
-load_models()
-print("Models loaded, ready to serve!", flush=True)
+# --- Answer Evaluation Endpoint ---
+@app.route('/evaluate-answer', methods=['POST'])
+def evaluate_answer():
+    """
+    Score a candidate's spoken answer against the expected answer.
+    Uses Sentence Transformers (all-MiniLM-L6-v2) for semantic similarity.
+
+    Request JSON:
+    {
+        "candidate_answer": "polymorphism lets one function work with many types",
+        "expected_answer": "polymorphism allows one interface to be used for different data types",
+        "question": "What is polymorphism?" (optional, for context)
+    }
+
+    Response JSON:
+    {
+        "score": 85,           // 0-100
+        "similarity": 0.85,    // raw cosine similarity
+        "feedback": "Good answer! ...",
+        "grade": "Good"        // Excellent / Good / Fair / Poor
+    }
+    """
+    try:
+        if answer_evaluator is None:
+            return jsonify({"error": "Answer evaluator not loaded yet. Please wait and retry."}), 503
+
+        data = request.json
+        candidate_answer = data.get('candidate_answer', '').strip()
+        expected_answer = data.get('expected_answer', '').strip()
+        question = data.get('question', '').strip()
+
+        if not candidate_answer:
+            return jsonify({"error": "candidate_answer is required"}), 400
+        if not expected_answer:
+            return jsonify({"error": "expected_answer is required"}), 400
+
+        # Encode both answers into embeddings
+        from sklearn.metrics.pairwise import cosine_similarity
+
+        embeddings = answer_evaluator.encode([candidate_answer, expected_answer])
+        similarity = float(cosine_similarity([embeddings[0]], [embeddings[1]])[0][0])
+
+        # Convert similarity (0 to 1) to score (0 to 100)
+        score = round(similarity * 100)
+
+        # Grade thresholds
+        if score >= 80:
+            grade = "Excellent"
+            feedback = "Great answer! Your response closely matches the expected answer."
+        elif score >= 60:
+            grade = "Good"
+            feedback = "Good answer. You covered the main points but could add more detail."
+        elif score >= 40:
+            grade = "Fair"
+            feedback = "Partial answer. You touched on some key points but missed important aspects."
+        else:
+            grade = "Poor"
+            feedback = "Your answer didn't align well with the expected response. Review this topic."
+
+        return jsonify({
+            "score": score,
+            "similarity": round(similarity, 4),
+            "grade": grade,
+            "feedback": feedback
+        })
+
+    except Exception as e:
+        print(f"Evaluation error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# --- Health Check ---
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status": "running",
+        "face_detector": "MediaPipe FaceMesh",
+        "face_detector_loaded": face_mesh is not None,
+        "yolo_loaded": yolo_model is not None,
+        "yolo_version": "YOLOv11 nano",
+        "answer_evaluator_loaded": answer_evaluator is not None,
+        "answer_evaluator_model": "all-MiniLM-L6-v2"
+    })
+
 
 if __name__ == '__main__':
-    print("Starting Flask server on port 5000...", flush=True)
-    print("Running on http://127.0.0.1:5000", flush=True)
+    load_yolo()
+    load_answer_evaluator()
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
