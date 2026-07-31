@@ -38,9 +38,9 @@ export default function Settings() {
     try {
       const file = e.target.files[0];
       const filePath = `${user.id}/avatar_${Date.now()}.${file.name.split('.').pop()}`;
-      const { error: uploadError } = await supabase.storage.from("interview-recordings").upload(filePath, file);
+      const { error: uploadError } = await supabase.storage.from("avatars").upload(filePath, file);
       if (uploadError) throw uploadError;
-      const { data: urlData } = supabase.storage.from("interview-recordings").getPublicUrl(filePath);
+      const { data: urlData } = supabase.storage.from("avatars").getPublicUrl(filePath);
       const url = urlData.publicUrl;
       await supabase.from("profiles" as any).update({ avatar_url: url } as any).eq("id", user.id);
       setAvatarUrl(url);
