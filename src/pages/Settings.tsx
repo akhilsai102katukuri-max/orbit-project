@@ -22,7 +22,7 @@ export default function Settings() {
     supabase
       .from("profiles" as any)
       .select("full_name, avatar_url")
-      .eq("user_id", user.id)
+      .eq("id", user.id)
       .single()
       .then(({ data }) => {
         if (data) {
@@ -42,7 +42,7 @@ export default function Settings() {
       if (uploadError) throw uploadError;
       const { data: urlData } = supabase.storage.from("interview-recordings").getPublicUrl(filePath);
       const url = urlData.publicUrl;
-      await supabase.from("profiles" as any).update({ avatar_url: url } as any).eq("user_id", user.id);
+      await supabase.from("profiles" as any).update({ avatar_url: url } as any).eq("id", user.id);
       setAvatarUrl(url);
       toast.success("Profile photo updated!");
     } catch (err: any) {
@@ -56,7 +56,7 @@ export default function Settings() {
     if (!user) return;
     setSaving(true);
     try {
-      await supabase.from("profiles" as any).update({ full_name: fullName } as any).eq("user_id", user.id);
+      await supabase.from("profiles" as any).update({ full_name: fullName } as any).eq("id", user.id);
       toast.success("Settings saved!");
     } catch (err: any) {
       toast.error(err.message || "Failed to save");
